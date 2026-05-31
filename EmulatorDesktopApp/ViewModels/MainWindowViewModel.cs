@@ -41,6 +41,7 @@ namespace EmulatorDesktopApp.ViewModels
         private bool _disposed;
         private string? _selectedDevice;
         private string _sessionId = string.Empty;
+        private bool _hasDeviceSession;
         private bool _isRefreshingDevices;
         private string _streamStatus = "No stream";
         private bool _isStreaming;
@@ -221,13 +222,33 @@ namespace EmulatorDesktopApp.ViewModels
         }
 
         /// <summary>
+        /// True when a device/emulator is bound to the current WebSocket session.
+        /// </summary>
+        public bool HasDeviceSession
+        {
+            get => _hasDeviceSession;
+            private set
+            {
+                if (_hasDeviceSession == value)
+                    return;
+
+                _hasDeviceSession = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(SessionStatus));
+                (CreateSessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                (DestroySessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            }
+        }
+
+        /// <summary>
         /// Human-readable session status for display (truncated for UI).
         /// </summary>
         public string SessionStatus
         {
             get
             {
-                if (string.IsNullOrEmpty(SessionId))
+                if (!HasDeviceSession || string.IsNullOrEmpty(SessionId))
                     return "No active session";
                 
                 // Show truncated session ID for compact display
@@ -319,6 +340,11 @@ namespace EmulatorDesktopApp.ViewModels
             IsConnecting = true;
             try
             {
+                if (IsConnected)
+                    await TeardownDeviceSessionAsync("reconnect");
+                else
+                    ResetLocalSessionState();
+
                 var connected = await _webSocketService.ConnectAsync(WebSocketUrl);
                 if (connected)
                 {
@@ -339,6 +365,7 @@ namespace EmulatorDesktopApp.ViewModels
             IsConnecting = true;
             try
             {
+                await TeardownDeviceSessionAsync("disconnect");
                 await _webSocketService.DisconnectAsync();
             }
             finally
@@ -375,7 +402,7 @@ namespace EmulatorDesktopApp.ViewModels
         // only allows one session per WS connection and the second attempt
         // would either error or silently rebind to the existing session.
         private bool CanExecuteCreateSession() =>
-            IsConnected && !string.IsNullOrEmpty(SelectedDevice) && string.IsNullOrEmpty(SessionId);
+            IsConnected && !string.IsNullOrEmpty(SelectedDevice) && !HasDeviceSession;
 
         private async Task ExecuteCreateSessionAsync()
         {
@@ -401,18 +428,39 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
-        private bool CanExecuteDestroySession() => IsConnected && !string.IsNullOrEmpty(SessionId);
+        private bool CanExecuteDestroySession() => IsConnected && HasDeviceSession;
 
         private async Task ExecuteDestroySessionAsync()
         {
-            // Stop stream first if currently streaming
+            await TeardownDeviceSessionAsync("manual destroy");
+        }
+
+        /// <summary>
+        /// Stops any active stream and destroys the bound device session on the server.
+        /// </summary>
+        private async Task TeardownDeviceSessionAsync(string reason)
+        {
             if (IsStreaming)
             {
-                AppendLog("[STREAM] Stopping stream before destroying session...");
+                AppendLog($"[SESSION] Stopping stream ({reason})...");
                 await ExecuteStopStreamAsync();
             }
+            else
+            {
+                CloseStreamWindow();
+                ClearStreamBitmap();
+            }
 
-            AppendLog($"Destroying session: {SessionId}...");
+            if (!IsConnected)
+            {
+                HasDeviceSession = false;
+                return;
+            }
+
+            if (!HasDeviceSession)
+                return;
+
+            AppendLog($"[SESSION] Destroying device session ({reason})...");
             var message = new
             {
                 type = "destroy_session",
@@ -421,11 +469,25 @@ namespace EmulatorDesktopApp.ViewModels
 
             var jsonMessage = JsonSerializer.Serialize(message);
             var success = await _webSocketService.SendMessageAsync(jsonMessage);
-
             if (!success)
+                AppendLog("[SESSION] Failed to send destroy session command");
+
+            HasDeviceSession = false;
+        }
+
+        private void ResetLocalSessionState()
+        {
+            if (IsStreaming)
             {
-                AppendLog("Failed to send destroy session command");
+                _mirror.WebRtc.StopStream();
+                IsStreaming = false;
+                StreamStatus = "No stream";
             }
+
+            ClearStreamBitmap();
+            CloseStreamWindow();
+            HasDeviceSession = false;
+            SessionId = string.Empty;
         }
 
         private void RefreshAllCommandStates()
@@ -441,11 +503,11 @@ namespace EmulatorDesktopApp.ViewModels
 
         #region Stream Commands
 
-        private bool CanExecuteStartStream() => IsConnected && !string.IsNullOrEmpty(SessionId) && !IsStreaming;
+        private bool CanExecuteStartStream() => IsConnected && HasDeviceSession && !IsStreaming;
 
         private async Task ExecuteStartStreamAsync()
         {
-            if (string.IsNullOrEmpty(SessionId))
+            if (!HasDeviceSession || string.IsNullOrEmpty(SessionId))
             {
                 AppendLog("[ERROR] Cannot start stream: No active session");
                 return;
@@ -630,6 +692,7 @@ namespace EmulatorDesktopApp.ViewModels
                                 if (!string.IsNullOrEmpty(sessionId))
                                 {
                                     SessionId = sessionId;
+                                    HasDeviceSession = true;
                                     AppendLog($"[INFO] Session created: {SessionId}");
                                 }
                             }
@@ -638,7 +701,7 @@ namespace EmulatorDesktopApp.ViewModels
                         // Handle session destroyed response
                         if (msgType == "session_destroyed")
                         {
-                            SessionId = string.Empty;
+                            HasDeviceSession = false;
                             AppendLog("[INFO] Session destroyed");
                         }
 
@@ -816,17 +879,7 @@ namespace EmulatorDesktopApp.ViewModels
                 {
                     Devices.Clear();
                     SelectedDevice = null;
-                    SessionId = string.Empty;
-                    
-                    // Stop stream if active
-                    if (IsStreaming)
-                    {
-                        _mirror.WebRtc.StopStream();
-                        IsStreaming = false;
-                        StreamStatus = "No stream";
-                        ClearStreamBitmap();
-                        CloseStreamWindow();
-                    }
+                    ResetLocalSessionState();
                 }
             });
         }

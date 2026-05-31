@@ -172,6 +172,16 @@ const messageHandlers = {
   destroy_session: async (session, payload) => {
     const { kill_emulator = true } = payload;
 
+    if (session.streamState !== 'idle') {
+      logger.info('Destroy session - stopping active stream first', {
+        sessionId: session.id,
+        streamState: session.streamState
+      });
+      streamManager.stopStream(session.id);
+      webrtcSignaling.closeSession(session.id);
+      session.cleanupStream();
+    }
+
     if (!session.deviceId) {
       session.sendSuccess('session_destroyed', {
         session_id: session.id,
