@@ -16,16 +16,30 @@ function shell(deviceId, cmd) {
   });
 }
 
+function parseWmSizeOutput(out) {
+  const physical = out.match(/Physical size:\s*(\d+)x(\d+)/i);
+  if (physical) {
+    return { width: parseInt(physical[1], 10), height: parseInt(physical[2], 10) };
+  }
+  const override = out.match(/Override size:\s*(\d+)x(\d+)/i);
+  if (override) {
+    return { width: parseInt(override[1], 10), height: parseInt(override[2], 10) };
+  }
+  const any = out.match(/(\d+)x(\d+)/);
+  if (any) {
+    return { width: parseInt(any[1], 10), height: parseInt(any[2], 10) };
+  }
+  return null;
+}
+
 function queryDisplaySize(deviceId) {
   return new Promise((resolve) => {
     const proc = spawn(streamConfig.adbPath, ['-s', deviceId, 'shell', 'wm', 'size']);
     let out = '';
     proc.stdout.on('data', (d) => { out += d.toString(); });
     proc.on('close', () => {
-      const match = out.match(/(\d+)x(\d+)/);
-      resolve(match
-        ? { width: parseInt(match[1], 10), height: parseInt(match[2], 10) }
-        : { width: 1080, height: 1920 });
+      const parsed = parseWmSizeOutput(out);
+      resolve(parsed || { width: 1080, height: 1920 });
     });
     proc.on('error', () => resolve({ width: 1080, height: 1920 }));
   });
@@ -47,10 +61,10 @@ async function injectInput(deviceId, displaySize, event) {
         return { success: true, x, y };
       }
       case 'swipe': {
-        const x1 = Math.round(event.x1 * width);
-        const y1 = Math.round(event.y1 * height);
-        const x2 = Math.round(event.x2 * width);
-        const y2 = Math.round(event.y2 * height);
+        const x1 = Math.round(Math.max(0, Math.min(1, event.x1)) * width);
+        const y1 = Math.round(Math.max(0, Math.min(1, event.y1)) * height);
+        const x2 = Math.round(Math.max(0, Math.min(1, event.x2)) * width);
+        const y2 = Math.round(Math.max(0, Math.min(1, event.y2)) * height);
         const dur = event.durationMs ?? 150;
         await shell(deviceId, `input swipe ${x1} ${y1} ${x2} ${y2} ${dur}`);
         return { success: true };

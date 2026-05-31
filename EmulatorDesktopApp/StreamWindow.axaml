@@ -3,41 +3,106 @@
         xmlns:vm="using:EmulatorDesktopApp.ViewModels"
         x:Class="EmulatorDesktopApp.StreamWindow"
         x:DataType="vm:StreamWindowViewModel"
-        Title="Live Stream"
-        Width="900"
-        Height="700"
-        MinWidth="480"
-        MinHeight="360"
+        Title="{Binding WindowTitle}"
+        Width="417"
+        Height="680"
+        MinWidth="417"
+        MinHeight="480"
         WindowStartupLocation="CenterScreen"
-        Background="#000000">
+        Background="#1A1A1A">
+
+    <Window.Styles>
+        <Style Selector="Button.emu-tool">
+            <Setter Property="Width" Value="46" />
+            <Setter Property="Height" Value="46" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0,1" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="Foreground" Value="#5F6368" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+        <Style Selector="Button.emu-tool:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#DADCE0" />
+        </Style>
+        <Style Selector="Button.emu-tool:disabled">
+            <Setter Property="Opacity" Value="0.35" />
+        </Style>
+        <Style Selector="Viewbox.emu-icon">
+            <Setter Property="Width" Value="22" />
+            <Setter Property="Height" Value="22" />
+        </Style>
+        <Style Selector="Path.emu-icon-fill">
+            <Setter Property="Stretch" Value="Uniform" />
+            <Setter Property="Fill" Value="#5F6368" />
+        </Style>
+        <Style Selector="Path.emu-icon-stroke">
+            <Setter Property="Stretch" Value="Uniform" />
+            <Setter Property="Fill" Value="Transparent" />
+            <Setter Property="Stroke" Value="#5F6368" />
+            <Setter Property="StrokeThickness" Value="1.75" />
+            <Setter Property="StrokeLineCap" Value="Round" />
+            <Setter Property="StrokeJoin" Value="Round" />
+        </Style>
+        <Style Selector="Border.emu-toolbar-separator">
+            <Setter Property="Height" Value="1" />
+            <Setter Property="Background" Value="#DADCE0" />
+            <Setter Property="Margin" Value="10,8" />
+        </Style>
+    </Window.Styles>
 
     <Grid RowDefinitions="Auto,*">
-        <Border Grid.Row="0"
+        <!-- Top app bar -->
+        <Border x:Name="AppBar"
+                Grid.Row="0"
                 Background="#1A1A1A"
                 Padding="12,8">
-            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
-                <StackPanel Grid.Column="0" Spacing="2">
-                    <TextBlock Text="{Binding SessionLabel}"
-                               FontSize="12"
-                               Foreground="#AAAAAA" />
-                    <TextBlock Text="{Binding StreamStatus}"
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Grid.Column="0"
+                            MinWidth="0"
+                            Margin="0,0,8,0"
+                            Spacing="4">
+                    <TextBlock Text="{Binding DeviceLabel}"
                                FontSize="14"
                                FontWeight="SemiBold"
-                               Foreground="#FFFFFF" />
+                               Foreground="#FFFFFF"
+                               TextTrimming="CharacterEllipsis" />
+                    <Grid ColumnDefinitions="Auto,Auto,*"
+                          MinWidth="0">
+                        <TextBlock Grid.Column="0"
+                                   Text="{Binding StreamStatus}"
+                                   FontSize="12"
+                                   Foreground="#AAAAAA"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding SessionHint}"
+                                   FontSize="11"
+                                   Foreground="#777777"
+                                   Margin="8,0,0,0"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding SessionHint, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                        <TextBlock Grid.Column="2"
+                                   Text="{Binding MetricsText}"
+                                   FontSize="11"
+                                   Foreground="#88FF88"
+                                   Margin="8,0,0,0"
+                                   VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                    </Grid>
                 </StackPanel>
-                <TextBlock Grid.Column="1"
-                           Grid.ColumnSpan="2"
-                           Text="{Binding MetricsText}"
-                           VerticalAlignment="Center"
-                           Margin="0,0,12,0"
-                           FontSize="11"
-                           Foreground="#88FF88" />
-                <Button Grid.Column="3"
-                        Content="Stop Stream"
+                <Button Grid.Column="1"
+                        Content="Stop"
                         Command="{Binding StopStreamCommand}"
-                        Margin="0,0,8,0"
-                        Padding="16,8"
-                        CornerRadius="6"
+                        VerticalAlignment="Top"
+                        Margin="0,1,0,0"
+                        Padding="10,4"
+                        MinWidth="52"
+                        FontSize="11"
+                        CornerRadius="4"
                         Background="#FF5722"
                         Foreground="#FFFFFF"
                         FontWeight="SemiBold"
@@ -45,36 +110,135 @@
             </Grid>
         </Border>
 
-        <Border Grid.Row="1"
-                Background="#000000"
-                ClipToBounds="True">
-            <Grid>
-                <StackPanel HorizontalAlignment="Center"
-                            VerticalAlignment="Center"
-                            IsVisible="{Binding ShowVideoPlaceholder}"
-                            Spacing="8">
-                    <TextBlock Text="Waiting for video..."
-                               FontSize="16"
-                               Foreground="#666666"
-                               HorizontalAlignment="Center" />
-                    <TextBlock Text="Stream is negotiating or encoding"
-                               FontSize="12"
-                               Foreground="#444444"
-                               HorizontalAlignment="Center" />
+        <!-- Video + divider + side toolbar -->
+        <Grid Grid.Row="1" ColumnDefinitions="Auto,1,Auto">
+            <Border x:Name="VideoColumn"
+                    Grid.Column="0"
+                    Width="360"
+                    Background="#000000"
+                    ClipToBounds="True">
+                <Grid>
+                    <StackPanel HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding ShowVideoPlaceholder}"
+                                Spacing="8">
+                        <TextBlock Text="Waiting for video..."
+                                   FontSize="16"
+                                   Foreground="#666666"
+                                   HorizontalAlignment="Center" />
+                        <TextBlock Text="Stream is negotiating or encoding"
+                                   FontSize="12"
+                                   Foreground="#444444"
+                                   HorizontalAlignment="Center" />
+                    </StackPanel>
+                    <Border x:Name="VideoSurface"
+                            HorizontalAlignment="Stretch"
+                            VerticalAlignment="Stretch"
+                            Background="Transparent"
+                            IsVisible="{Binding HasVideoFrame}">
+                        <Image x:Name="VideoImage"
+                               Source="{Binding CurrentFrame}"
+                               Stretch="Fill"
+                               RenderOptions.BitmapInterpolationMode="None"
+                               HorizontalAlignment="Stretch"
+                               VerticalAlignment="Stretch" />
+                    </Border>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="1"
+                    Background="#000000" />
+
+            <Border Grid.Column="2"
+                    Width="56"
+                    Background="#ECECEC"
+                    BorderThickness="0">
+                <StackPanel Margin="0,10,0,10" Spacing="0">
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Power"
+                            Command="{Binding PowerCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Canvas Width="24" Height="24">
+                                <Path Stroke="#5F6368"
+                                      StrokeThickness="2"
+                                      StrokeLineCap="Round"
+                                      Fill="Transparent"
+                                      Data="M12,2.5 L12,9.5" />
+                                <Path Stroke="#5F6368"
+                                      StrokeThickness="2"
+                                      StrokeLineCap="Round"
+                                      Fill="Transparent"
+                                      Data="M7,10 A5.5,5.5 0 1,1 17,10" />
+                            </Canvas>
+                        </Viewbox>
+                    </Button>
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Volume up"
+                            Command="{Binding VolumeUpCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Path Classes="emu-icon-fill"
+                                  Data="M3,10 L3,14 L7,14 L12,19 L12,5 L7,10 Z M16.5,12 C16.5,10.23 15.48,8.71 14,7.97 L14,16.03 C15.48,15.29 16.5,13.77 16.5,12 Z M18.5,12 C18.5,9.46 17.02,7.28 14.75,6.23 L14.75,17.77 C17.02,16.72 18.5,14.54 18.5,12 Z" />
+                        </Viewbox>
+                    </Button>
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Volume down"
+                            Command="{Binding VolumeDownCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Path Classes="emu-icon-fill"
+                                  Data="M3,10 L3,14 L7,14 L12,19 L12,5 L7,10 Z" />
+                        </Viewbox>
+                    </Button>
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Screenshot"
+                            Command="{Binding ScreenshotCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Path Classes="emu-icon-fill"
+                                  Data="M9,3 L7.17,5 L4,5 C2.9,5 2,5.9 2,7 L2,17 C2,18.1 2.9,19 4,19 L20,19 C21.1,19 22,18.1 22,17 L22,7 C22,5.9 21.1,5 20,5 L16.83,5 L15,3 Z M12,17 C9.24,17 7,14.76 7,12 C7,9.24 9.24,7 12,7 C14.76,7 17,9.24 17,12 C17,14.76 14.76,17 12,17 Z M12,9 C10.34,9 9,10.34 9,12 C9,13.66 10.34,15 12,15 C13.66,15 15,13.66 15,12 C15,10.34 13.66,9 12,9 Z" />
+                        </Viewbox>
+                    </Button>
+
+                    <Border Classes="emu-toolbar-separator" />
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Back"
+                            Command="{Binding BackCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Path Classes="emu-icon-fill"
+                                  Data="M15.41,7.41 L14,6 L6,12 L14,18 L15.41,16.59 L10.83,12 Z" />
+                        </Viewbox>
+                    </Button>
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Home"
+                            Command="{Binding HomeCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Ellipse Width="16"
+                                     Height="16"
+                                     Stroke="#5F6368"
+                                     StrokeThickness="2"
+                                     Fill="Transparent" />
+                        </Viewbox>
+                    </Button>
+
+                    <Button Classes="emu-tool"
+                            ToolTip.Tip="Overview"
+                            Command="{Binding RecentAppsCommand}">
+                        <Viewbox Classes="emu-icon">
+                            <Rectangle Width="16"
+                                       Height="16"
+                                       Stroke="#5F6368"
+                                       StrokeThickness="2"
+                                       RadiusX="2"
+                                       RadiusY="2"
+                                       Fill="Transparent" />
+                        </Viewbox>
+                    </Button>
                 </StackPanel>
-                <Border x:Name="VideoSurface"
-                        HorizontalAlignment="Stretch"
-                        VerticalAlignment="Stretch"
-                        Background="Transparent"
-                        IsVisible="{Binding HasVideoFrame}">
-                    <Image x:Name="VideoImage"
-                           Source="{Binding CurrentFrame}"
-                           Stretch="Uniform"
-                           RenderOptions.BitmapInterpolationMode="None"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center" />
-                </Border>
-            </Grid>
-        </Border>
+            </Border>
+        </Grid>
     </Grid>
 </Window>

@@ -119,6 +119,34 @@ namespace EmulatorDesktopApp.ViewModels
         }
 
         /// <summary>
+        /// Primary header line — device id (or fallback label).
+        /// </summary>
+        public string DeviceLabel
+        {
+            get
+            {
+                var device = _mainViewModel.SelectedDevice;
+                return string.IsNullOrEmpty(device) ? "Android Emulator" : device;
+            }
+        }
+
+        /// <summary>
+        /// Short session id for the second header line.
+        /// </summary>
+        public string SessionHint
+        {
+            get
+            {
+                var sessionId = _mainViewModel.SessionId;
+                if (string.IsNullOrEmpty(sessionId))
+                    return string.Empty;
+
+                var shortSession = sessionId.Length > 8 ? sessionId.Substring(0, 8) : sessionId;
+                return $"session {shortSession}";
+            }
+        }
+
+        /// <summary>
         /// Window title shown in the custom title bar. Mirrors the
         /// "Android Emulator — &lt;device&gt;" format the official emulator uses.
         /// </summary>
@@ -195,20 +223,24 @@ namespace EmulatorDesktopApp.ViewModels
         public void UpdateStatus(string status) => StreamStatus = status;
 
         // ── Pointer mapping ───────────────────────────────────────────────────
+        //
+        // VideoImage uses Stretch="Uniform" — the picture is letterboxed inside
+        // VideoSurface. Normalizing against the full surface shifts taps toward
+        // the centre and makes the device hit the wrong list item.
 
-        public Task HandlePointerPressedAsync(Point position, Size viewSize)
+        public Task HandlePointerPressedAsync(Point position, Size viewSize, Size videoSize)
         {
-            if (TryNormalize(position, viewSize, out var nx, out var ny))
+            if (TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
                 _swipeStart = new Point(nx, ny);
             return Task.CompletedTask;
         }
 
-        public async Task HandlePointerReleasedAsync(Point position, Size viewSize)
+        public async Task HandlePointerReleasedAsync(Point position, Size viewSize, Size videoSize)
         {
             if (_swipeStart is not { } start)
                 return;
 
-            if (!TryNormalize(position, viewSize, out var nx, out var ny))
+            if (!TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
             {
                 _swipeStart = null;
                 return;
@@ -226,12 +258,63 @@ namespace EmulatorDesktopApp.ViewModels
             _swipeStart = null;
         }
 
-        private static bool TryNormalize(Point position, Size viewSize, out double nx, out double ny)
+        internal static bool TryNormalize(
+            Point position,
+            Size viewSize,
+            Size videoSize,
+            out double nx,
+            out double ny)
         {
             nx = ny = 0;
-            if (viewSize.Width <= 0 || viewSize.Height <= 0) return false;
-            nx = Math.Clamp(position.X / viewSize.Width,  0, 1);
-            ny = Math.Clamp(position.Y / viewSize.Height, 0, 1);
+            if (viewSize.Width <= 0 || viewSize.Height <= 0)
+                return false;
+
+            if (videoSize.Width <= 0 || videoSize.Height <= 0)
+            {
+                nx = Math.Clamp(position.X / viewSize.Width, 0, 1);
+                ny = Math.Clamp(position.Y / viewSize.Height, 0, 1);
+                return true;
+            }
+
+            if (!TryGetUniformContentRect(viewSize, videoSize, out var contentRect))
+                return false;
+
+            if (!contentRect.Contains(position))
+                return false;
+
+            nx = Math.Clamp((position.X - contentRect.X) / contentRect.Width, 0, 1);
+            ny = Math.Clamp((position.Y - contentRect.Y) / contentRect.Height, 0, 1);
+            return true;
+        }
+
+        internal static bool TryGetUniformContentRect(Size viewSize, Size videoSize, out Rect contentRect)
+        {
+            contentRect = default;
+            if (viewSize.Width <= 0 || viewSize.Height <= 0 ||
+                videoSize.Width <= 0 || videoSize.Height <= 0)
+            {
+                return false;
+            }
+
+            double videoAspect = videoSize.Width / videoSize.Height;
+            double viewAspect = viewSize.Width / viewSize.Height;
+
+            double contentWidth;
+            double contentHeight;
+            if (viewAspect > videoAspect)
+            {
+                contentHeight = viewSize.Height;
+                contentWidth = contentHeight * videoAspect;
+            }
+            else
+            {
+                contentWidth = viewSize.Width;
+                contentHeight = contentWidth / videoAspect;
+            }
+
+            double offsetX = (viewSize.Width - contentWidth) / 2;
+            double offsetY = (viewSize.Height - contentHeight) / 2;
+            contentRect = new Rect(offsetX, offsetY, contentWidth, contentHeight);
             return true;
         }
 
