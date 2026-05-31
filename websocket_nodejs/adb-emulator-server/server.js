@@ -13,6 +13,7 @@ const { webrtcSignaling } = require('./webrtcSignaling');
 const { controlRouter } = require('./control/ControlRouter');
 const { streamConfig } = require('./lib/config');
 const { streamManager } = require('./stream');
+const { buildDeviceCatalog, resolveAvdNameForDevice } = require('./devicesCatalog');
 
 // Configuration
 const PORT = parseInt(process.env.PORT, 10) || 8080;
@@ -40,6 +41,47 @@ const logger = {
     }
   }
 };
+
+/**
+ * Stop stream and unbind device from a session without closing its WebSocket.
+ */
+async function releaseSessionDevice(session, { killEmulator = KILL_EMULATOR_ON_DISCONNECT } = {}) {
+  if (session.streamState !== 'idle') {
+    streamManager.stopStream(session.id);
+    webrtcSignaling.closeSession(session.id);
+    session.cleanupStream();
+  }
+
+  if (!session.deviceId) {
+    return { released: false };
+  }
+
+  const deviceId = session.deviceId;
+  const emulatorName = session.emulatorName;
+  const ownsEmulator = session.ownsEmulator;
+
+  if (killEmulator && ownsEmulator) {
+    const result = await emulatorManager.stopEmulator(deviceId, session.id);
+    if (!result.success) {
+      logger.error('Failed to stop emulator during session release', {
+        sessionId: session.id,
+        deviceId,
+        error: result.error
+      });
+    }
+  } else {
+    emulatorManager.unbindEmulator(deviceId, session.id);
+  }
+
+  sessionManager.clearDevice(session.id);
+
+  return {
+    released: true,
+    deviceId,
+    emulatorName,
+    emulatorKilled: killEmulator && ownsEmulator
+  };
+}
 
 /**
  * Message handler registry
@@ -72,13 +114,18 @@ const messageHandlers = {
       return;
     }
 
-    // Check if session already has a device
+    const removed = await sessionManager.destroyAllOtherSessions(session.id, {
+      killEmulator: KILL_EMULATOR_ON_DISCONNECT
+    });
+    if (removed > 0) {
+      logger.info('Destroyed previous sessions before create_session', {
+        sessionId: session.id,
+        removed
+      });
+    }
+
     if (session.deviceId) {
-      session.sendError('session_created', 
-        `Session already has device ${session.deviceId}. Use destroy_session first.`, 
-        payload.requestId
-      );
-      return;
+      await releaseSessionDevice(session, { killEmulator: KILL_EMULATOR_ON_DISCONNECT });
     }
 
     // Check if 'device' is actually a device_id of an already running device
@@ -98,7 +145,62 @@ const messageHandlers = {
       }
       
       if (existingDevice.status !== 'online') {
-        session.sendError('session_created', `Device ${device} is not ready (status: ${existingDevice.status})`, payload.requestId);
+        let avdName = null;
+
+        const catalog = await buildDeviceCatalog();
+        const catalogEntry = catalog.devices.find((entry) => entry.device_id === device);
+        if (catalogEntry?.avd_name) {
+          avdName = catalogEntry.avd_name;
+        }
+
+        if (!avdName) {
+          const emuInfo = emulatorManager.getEmulatorInfo(device);
+          avdName = emuInfo?.emulatorName || null;
+        }
+
+        if (!avdName && device.startsWith('emulator-')) {
+          avdName = await resolveAvdNameForDevice(device);
+        }
+
+        if (avdName) {
+          logger.info('Offline device selected — starting AVD on server', {
+            sessionId: session.id,
+            deviceId: device,
+            avdName,
+            status: existingDevice.status
+          });
+
+          session.send({
+            type: 'session_creating',
+            device: avdName,
+            message: 'Device is offline. Starting emulator on server...',
+            requestId: payload.requestId
+          });
+
+          const startResult = await emulatorManager.getOrStartEmulator(session.id, avdName, options);
+          if (!startResult.success) {
+            session.sendError('session_created', startResult.error, payload.requestId);
+            return;
+          }
+
+          session.assignEmulator(avdName, startResult.deviceId, !startResult.alreadyRunning);
+          sessionManager.assignDevice(session.id, startResult.deviceId);
+
+          session.sendSuccess('session_created', {
+            session_id: session.id,
+            device_id: startResult.deviceId,
+            emulator_name: avdName,
+            already_running: startResult.alreadyRunning,
+            started_from_offline: true
+          }, payload.requestId);
+          return;
+        }
+
+        session.sendError(
+          'session_created',
+          `Device ${device} is ${existingDevice.status}. Select the AVD name from the list to start it on the server.`,
+          payload.requestId
+        );
         return;
       }
       
@@ -177,12 +279,11 @@ const messageHandlers = {
         sessionId: session.id,
         streamState: session.streamState
       });
-      streamManager.stopStream(session.id);
-      webrtcSignaling.closeSession(session.id);
-      session.cleanupStream();
     }
 
-    if (!session.deviceId) {
+    const released = await releaseSessionDevice(session, { killEmulator: kill_emulator });
+
+    if (!released.released) {
       session.sendSuccess('session_destroyed', {
         session_id: session.id,
         message: 'No device was bound to session'
@@ -190,37 +291,11 @@ const messageHandlers = {
       return;
     }
 
-    const deviceId = session.deviceId;
-    const emulatorName = session.emulatorName;
-
-    logger.info(`Destroying session binding`, {
-      sessionId: session.id,
-      deviceId,
-      killEmulator: kill_emulator
-    });
-
-    if (kill_emulator && session.ownsEmulator) {
-      // Stop the emulator
-      const result = await emulatorManager.stopEmulator(deviceId, session.id);
-      if (!result.success) {
-        logger.error(`Failed to stop emulator during session destroy`, {
-          sessionId: session.id,
-          deviceId,
-          error: result.error
-        });
-      }
-    } else {
-      // Just unbind
-      emulatorManager.unbindEmulator(deviceId, session.id);
-    }
-
-    sessionManager.clearDevice(session.id);
-
     session.sendSuccess('session_destroyed', {
       session_id: session.id,
-      device_id: deviceId,
-      emulator_name: emulatorName,
-      emulator_killed: kill_emulator && session.ownsEmulator
+      device_id: released.deviceId,
+      emulator_name: released.emulatorName,
+      emulator_killed: released.emulatorKilled
     }, payload.requestId);
   },
 
@@ -310,10 +385,13 @@ const messageHandlers = {
    * Get connected devices
    */
   get_devices: async (session, payload) => {
-    const result = await adb.getDevices();
+    const result = await buildDeviceCatalog();
     
     if (result.success) {
-      session.sendSuccess('devices_list', { devices: result.devices }, payload.requestId);
+      session.sendSuccess('devices_list', {
+        devices: result.devices,
+        avd_list_error: result.avd_list_error
+      }, payload.requestId);
     } else {
       session.sendError('devices_list', result.error, payload.requestId);
     }

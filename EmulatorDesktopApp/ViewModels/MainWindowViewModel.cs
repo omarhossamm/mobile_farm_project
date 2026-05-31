@@ -39,7 +39,8 @@ namespace EmulatorDesktopApp.ViewModels
         private bool _isConnected;
         private bool _isConnecting;
         private bool _disposed;
-        private string? _selectedDevice;
+        private DeviceOption? _selectedDevice;
+        private string? _pendingSelectDeviceId;
         private string _sessionId = string.Empty;
         private bool _hasDeviceSession;
         private bool _isRefreshingDevices;
@@ -78,7 +79,7 @@ namespace EmulatorDesktopApp.ViewModels
             _mirror.WebRtc.OnSceneCut = () => _mirror.Render.OnSceneCut();
 
             // Initialize device collection
-            Devices = new ObservableCollection<string>();
+            Devices = new ObservableCollection<DeviceOption>();
 
             // Initialize commands
             ConnectCommand = new AsyncRelayCommand(ExecuteConnectAsync, CanExecuteConnect);
@@ -180,26 +181,33 @@ namespace EmulatorDesktopApp.ViewModels
         public string ConnectionStatusColor => IsConnected ? "#4CAF50" : "#F44336";
 
         /// <summary>
-        /// Collection of available devices from the server.
+        /// Collection of all devices from the server (online, offline, and stopped AVDs).
         /// </summary>
-        public ObservableCollection<string> Devices { get; }
+        public ObservableCollection<DeviceOption> Devices { get; }
 
         /// <summary>
         /// The currently selected device from the dropdown.
         /// </summary>
-        public string? SelectedDevice
+        public DeviceOption? SelectedDevice
         {
             get => _selectedDevice;
             set
             {
-                if (_selectedDevice != value)
+                if (!Equals(_selectedDevice, value))
                 {
                     _selectedDevice = value;
                     OnPropertyChanged();
+                    OnPropertyChanged(nameof(SelectedDeviceId));
                     (CreateSessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                    (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
                 }
             }
         }
+
+        /// <summary>
+        /// Device id / AVD name sent to the server when creating a session.
+        /// </summary>
+        public string? SelectedDeviceId => SelectedDevice?.Id;
 
         /// <summary>
         /// The current session ID if a session is active.
@@ -398,25 +406,33 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
-        // Block re-creation while a session is already open — the gateway
-        // only allows one session per WS connection and the second attempt
-        // would either error or silently rebind to the existing session.
         private bool CanExecuteCreateSession() =>
-            IsConnected && !string.IsNullOrEmpty(SelectedDevice) && !HasDeviceSession;
+            IsConnected && SelectedDevice != null && !HasDeviceSession;
 
         private async Task ExecuteCreateSessionAsync()
         {
-            if (string.IsNullOrEmpty(SelectedDevice))
+            if (SelectedDevice == null)
             {
                 AppendLog("[ERROR] Please select a device first");
                 return;
             }
 
-            AppendLog($"Creating session for device: {SelectedDevice}...");
+            if (HasDeviceSession)
+            {
+                AppendLog("[ERROR] Destroy the current session before creating a new one");
+                return;
+            }
+
+            if (!SelectedDevice.IsOnline)
+            {
+                AppendLog($"[INFO] '{SelectedDevice.DisplayName}' is offline — starting on server...");
+            }
+
+            AppendLog($"Creating session for device: {SelectedDevice.DisplayName}...");
             var message = new
             {
                 type = "create_session",
-                device = SelectedDevice
+                device = SelectedDevice.Id
             };
 
             var jsonMessage = JsonSerializer.Serialize(message);
@@ -503,13 +519,20 @@ namespace EmulatorDesktopApp.ViewModels
 
         #region Stream Commands
 
-        private bool CanExecuteStartStream() => IsConnected && HasDeviceSession && !IsStreaming;
+        private bool CanExecuteStartStream() =>
+            IsConnected && HasDeviceSession && SelectedDevice?.IsOnline == true && !IsStreaming;
 
         private async Task ExecuteStartStreamAsync()
         {
             if (!HasDeviceSession || string.IsNullOrEmpty(SessionId))
             {
                 AppendLog("[ERROR] Cannot start stream: No active session");
+                return;
+            }
+
+            if (SelectedDevice?.IsOnline != true)
+            {
+                AppendLog("[ERROR] Cannot start stream: Device is not online yet");
                 return;
             }
 
@@ -522,7 +545,7 @@ namespace EmulatorDesktopApp.ViewModels
             await _mirror.WebRtc.PrepareStreamAsync(SessionId);
 
             // Send start_stream message to server
-            var message = WebRTCClient.CreateStartStreamMessage(SessionId, SelectedDevice ?? "");
+            var message = WebRTCClient.CreateStartStreamMessage(SessionId, SelectedDeviceId ?? "");
             var success = await _webSocketService.SendMessageAsync(message);
 
             if (!success)
@@ -589,68 +612,50 @@ namespace EmulatorDesktopApp.ViewModels
                         if ((msgType == "devices_list" || msgType == "get_devices_response" || msgType == "list_devices_response") && 
                             root.TryGetProperty("data", out var dataElement))
                         {
+                            var previousId = SelectedDevice?.Id;
                             Devices.Clear();
                             
-                            // Format 1: data.devices array
                             if (dataElement.TryGetProperty("devices", out var devicesElement))
                             {
                                 foreach (var device in devicesElement.EnumerateArray())
                                 {
-                                    string? deviceName = null;
-                                    if (device.ValueKind == JsonValueKind.Object && 
-                                        device.TryGetProperty("device_id", out var deviceIdElement))
+                                    var option = ParseDeviceOption(device);
+                                    if (option != null)
                                     {
-                                        deviceName = deviceIdElement.GetString();
-                                    }
-                                    else if (device.ValueKind == JsonValueKind.String)
-                                    {
-                                        deviceName = device.GetString();
-                                    }
-                                    
-                                    if (!string.IsNullOrEmpty(deviceName))
-                                    {
-                                        Devices.Add(deviceName);
-                                    }
-                                }
-                            }
-                            
-                            // Format 2: data.connected_devices array
-                            if (dataElement.TryGetProperty("connected_devices", out var connectedDevices))
-                            {
-                                foreach (var device in connectedDevices.EnumerateArray())
-                                {
-                                    if (device.TryGetProperty("device_id", out var deviceIdElement))
-                                    {
-                                        var deviceName = deviceIdElement.GetString();
-                                        if (!string.IsNullOrEmpty(deviceName) && !Devices.Contains(deviceName))
-                                        {
-                                            Devices.Add(deviceName);
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Format 3: data.available_emulators.avds array
-                            if (dataElement.TryGetProperty("available_emulators", out var emulatorsElement) &&
-                                emulatorsElement.TryGetProperty("avds", out var avdsElement))
-                            {
-                                foreach (var avd in avdsElement.EnumerateArray())
-                                {
-                                    var avdName = avd.GetString();
-                                    if (!string.IsNullOrEmpty(avdName) && !Devices.Contains(avdName))
-                                    {
-                                        Devices.Add(avdName);
+                                        Devices.Add(option);
                                     }
                                 }
                             }
                             
                             AppendLog($"[INFO] Received {Devices.Count} device(s)/emulator(s)");
-                            
-                            // Auto-select first device if available
-                            if (Devices.Count > 0 && SelectedDevice == null)
+
+                            DeviceOption? restored = null;
+                            if (!string.IsNullOrEmpty(_pendingSelectDeviceId))
                             {
-                                SelectedDevice = Devices[0];
+                                foreach (var device in Devices)
+                                {
+                                    if (device.Id == _pendingSelectDeviceId)
+                                    {
+                                        restored = device;
+                                        break;
+                                    }
+                                }
+                                _pendingSelectDeviceId = null;
                             }
+                            else if (!string.IsNullOrEmpty(previousId))
+                            {
+                                foreach (var device in Devices)
+                                {
+                                    if (device.Id == previousId)
+                                    {
+                                        restored = device;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            SelectedDevice = restored ?? (Devices.Count > 0 ? Devices[0] : null);
+                            (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
                         }
 
                         // WebSocket connected (server assigns session id immediately)
@@ -678,11 +683,17 @@ namespace EmulatorDesktopApp.ViewModels
                             else
                             {
                                 string? sessionId = null;
+                                string? boundDeviceId = null;
+                                string? emulatorName = null;
 
-                                if (ServerMessageJson.TryGetMessageData(root, out var sessionData) &&
-                                    sessionData.TryGetProperty("session_id", out var sessionIdElement))
+                                if (ServerMessageJson.TryGetMessageData(root, out var sessionData))
                                 {
-                                    sessionId = sessionIdElement.GetString();
+                                    if (sessionData.TryGetProperty("session_id", out var sessionIdElement))
+                                        sessionId = sessionIdElement.GetString();
+                                    if (sessionData.TryGetProperty("device_id", out var boundDeviceElement))
+                                        boundDeviceId = boundDeviceElement.GetString();
+                                    if (sessionData.TryGetProperty("emulator_name", out var emulatorNameElement))
+                                        emulatorName = emulatorNameElement.GetString();
                                 }
                                 else if (root.TryGetProperty("session_id", out var rootSessionElement))
                                 {
@@ -694,6 +705,11 @@ namespace EmulatorDesktopApp.ViewModels
                                     SessionId = sessionId;
                                     HasDeviceSession = true;
                                     AppendLog($"[INFO] Session created: {SessionId}");
+
+                                    MarkDeviceOnline(boundDeviceId, emulatorName);
+                                    _pendingSelectDeviceId = boundDeviceId;
+                                    _ = ExecuteRefreshDevicesAsync();
+                                    (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
                                 }
                             }
                         }
@@ -952,7 +968,7 @@ namespace EmulatorDesktopApp.ViewModels
                 var answerMessage = new
                 {
                     type = "webrtc_answer",
-                    emulator_id = SelectedDevice ?? "",
+                    emulator_id = SelectedDeviceId ?? "",
                     session_id = SessionId ?? "",
                     answer = new
                     {
@@ -999,7 +1015,7 @@ namespace EmulatorDesktopApp.ViewModels
                 var iceMessage = new
                 {
                     type = "ice_candidate",
-                    emulator_id = SelectedDevice ?? "",
+                    emulator_id = SelectedDeviceId ?? "",
                     session_id = SessionId ?? "",
                     candidate = candidateData
                 };
@@ -1047,7 +1063,7 @@ namespace EmulatorDesktopApp.ViewModels
             {
                 type = "shell_command",
                 session_id = SessionId,
-                device_id = SelectedDevice ?? string.Empty,
+                device_id = SelectedDeviceId ?? string.Empty,
                 command
             };
 
@@ -1078,7 +1094,7 @@ namespace EmulatorDesktopApp.ViewModels
             {
                 type = "screenshot",
                 session_id = SessionId,
-                device_id = SelectedDevice ?? string.Empty,
+                device_id = SelectedDeviceId ?? string.Empty,
                 local_path = localPath
             };
 
@@ -1122,6 +1138,123 @@ namespace EmulatorDesktopApp.ViewModels
         #endregion
 
         #region Helpers
+
+        private static DeviceOption? ParseDeviceOption(JsonElement device)
+        {
+            if (device.ValueKind == JsonValueKind.String)
+            {
+                var id = device.GetString();
+                if (string.IsNullOrEmpty(id))
+                    return null;
+
+                return new DeviceOption
+                {
+                    Id = id,
+                    DisplayName = id,
+                    Status = "unknown",
+                    Kind = "device"
+                };
+            }
+
+            if (device.ValueKind != JsonValueKind.Object)
+                return null;
+
+            if (!device.TryGetProperty("device_id", out var deviceIdElement))
+                return null;
+
+            var deviceId = deviceIdElement.GetString();
+            if (string.IsNullOrEmpty(deviceId))
+                return null;
+
+            var status = device.TryGetProperty("status", out var statusElement)
+                ? statusElement.GetString() ?? "unknown"
+                : "unknown";
+            var kind = device.TryGetProperty("kind", out var kindElement)
+                ? kindElement.GetString() ?? "device"
+                : "device";
+            var name = device.TryGetProperty("name", out var nameElement)
+                ? nameElement.GetString() ?? deviceId
+                : deviceId;
+            var avdName = device.TryGetProperty("avd_name", out var avdElement)
+                ? avdElement.GetString()
+                : null;
+
+            return new DeviceOption
+            {
+                Id = deviceId,
+                DisplayName = name,
+                Status = status,
+                Kind = kind,
+                AvdName = avdName
+            };
+        }
+
+        private void MarkDeviceOnline(string? deviceId, string? avdName = null)
+        {
+            if (string.IsNullOrEmpty(deviceId) && string.IsNullOrEmpty(avdName))
+                return;
+
+            DeviceOption? updatedSelection = null;
+            var selectedId = SelectedDevice?.Id;
+            var selectedAvd = SelectedDevice?.AvdName ?? selectedId;
+
+            for (var i = Devices.Count - 1; i >= 0; i--)
+            {
+                var entry = Devices[i];
+                var matchesId = !string.IsNullOrEmpty(deviceId) && entry.Id == deviceId;
+                var matchesAvd = !string.IsNullOrEmpty(avdName) &&
+                                   (entry.Id == avdName || entry.AvdName == avdName);
+                var matchesSelection = SelectedDevice != null &&
+                                       (entry.Id == selectedId || entry.Id == selectedAvd);
+
+                if (!matchesId && !matchesAvd && !matchesSelection)
+                    continue;
+
+                if (entry.Kind == "avd" && entry.Status == "offline" &&
+                    !string.IsNullOrEmpty(deviceId) && entry.Id != deviceId)
+                {
+                    Devices.RemoveAt(i);
+                    continue;
+                }
+
+                if (entry.IsOnline && entry.Id == (deviceId ?? entry.Id))
+                {
+                    updatedSelection = entry;
+                    continue;
+                }
+
+                var online = new DeviceOption
+                {
+                    Id = deviceId ?? entry.Id,
+                    DisplayName = !string.IsNullOrEmpty(avdName) ? avdName : entry.DisplayName,
+                    Status = "online",
+                    Kind = entry.Kind == "avd" ? "emulator" : entry.Kind,
+                    AvdName = avdName ?? entry.AvdName
+                };
+                Devices[i] = online;
+                updatedSelection = online;
+            }
+
+            if (updatedSelection != null)
+            {
+                SelectedDevice = updatedSelection;
+                return;
+            }
+
+            if (string.IsNullOrEmpty(deviceId))
+                return;
+
+            var created = new DeviceOption
+            {
+                Id = deviceId,
+                DisplayName = avdName ?? deviceId,
+                Status = "online",
+                Kind = "emulator",
+                AvdName = avdName
+            };
+            Devices.Add(created);
+            SelectedDevice = created;
+        }
 
         private void OpenStreamWindow()
         {

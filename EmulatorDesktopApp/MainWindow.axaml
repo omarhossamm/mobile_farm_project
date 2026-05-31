@@ -159,7 +159,23 @@
                              Background="#3C3C3C"
                              Foreground="#FFFFFF"
                              HorizontalAlignment="Stretch"
-                             Margin="0,0,12,0" />
+                             Margin="0,0,12,0">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DeviceOption">
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Ellipse Width="8"
+                                             Height="8"
+                                             VerticalAlignment="Center">
+                                        <Ellipse.Fill>
+                                            <SolidColorBrush Color="{Binding StatusColor}" />
+                                        </Ellipse.Fill>
+                                    </Ellipse>
+                                    <TextBlock Text="{Binding DisplayName}"
+                                               VerticalAlignment="Center" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
 
                     <Border Grid.Row="1" Grid.Column="1"
                            Background="#3C3C3C"

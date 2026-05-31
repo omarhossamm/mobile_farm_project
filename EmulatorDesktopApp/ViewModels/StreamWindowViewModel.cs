@@ -125,7 +125,7 @@ namespace EmulatorDesktopApp.ViewModels
         {
             get
             {
-                var device = _mainViewModel.SelectedDevice;
+                var device = _mainViewModel.SelectedDeviceId;
                 return string.IsNullOrEmpty(device) ? "Android Emulator" : device;
             }
         }
@@ -154,7 +154,7 @@ namespace EmulatorDesktopApp.ViewModels
         {
             get
             {
-                var device = _mainViewModel.SelectedDevice;
+                var device = _mainViewModel.SelectedDeviceId;
                 return string.IsNullOrEmpty(device)
                     ? "Android Emulator"
                     : $"Android Emulator — {device}";
@@ -174,7 +174,7 @@ namespace EmulatorDesktopApp.ViewModels
         {
             get
             {
-                var device = _mainViewModel.SelectedDevice;
+                var device = _mainViewModel.SelectedDeviceId;
                 var sessionId = _mainViewModel.SessionId;
                 var shortSession = string.IsNullOrEmpty(sessionId)
                     ? string.Empty

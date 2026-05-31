@@ -455,6 +455,45 @@ class SessionManager {
   }
 
   /**
+   * Destroy every session except the one being kept (closes their WebSockets).
+   * @param {string} keepSessionId
+   * @param {object} options - Passed to removeSession (e.g. killEmulator)
+   * @returns {Promise<number>} - Number of sessions removed
+   */
+  async destroyAllOtherSessions(keepSessionId, options = {}) {
+    const ids = [...this.sessions.keys()].filter((id) => id !== keepSessionId);
+    let removed = 0;
+
+    for (const sessionId of ids) {
+      const session = this.sessions.get(sessionId);
+      if (!session) {
+        continue;
+      }
+
+      try {
+        if (session.ws.readyState === session.ws.OPEN) {
+          session.send({
+            type: 'session_destroyed',
+            success: true,
+            data: {
+              session_id: sessionId,
+              message: 'Session closed because a new session was created'
+            }
+          });
+          session.ws.close(1000, 'Session replaced');
+        }
+      } catch (error) {
+        logger.warn('Failed notifying replaced session', { sessionId, error: error.message });
+      }
+
+      await this.removeSession(sessionId, options);
+      removed++;
+    }
+
+    return removed;
+  }
+
+  /**
    * Broadcast message to all sessions
    * @param {object} message - Message to broadcast
    * @param {function} filter - Optional filter function
