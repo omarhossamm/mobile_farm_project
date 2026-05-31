@@ -1,0 +1,103 @@
+# =============================================================================
+# remote_debug_desktop — keep the repo small (source only, no build output)
+# =============================================================================
+
+# --- macOS / Windows ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Editors / IDE ---
+.idea/
+.vs/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.DotSettings.user
+.vscode/
+*.code-workspace
+
+# Cursor local state (not project source)
+.cursor/
+
+# --- .NET / Avalonia (EmulatorDesktopApp) ---
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+TestResult.xml
+nupkg/
+artifacts/
+publish/
+*.nupkg
+*.snupkg
+
+# Build outputs (also matched outside bin/ if copied)
+*.dll
+*.exe
+*.pdb
+*.cache
+*.deps.json
+*.runtimeconfig.json
+project.lock.json
+project.fragment.lock.json
+*.GeneratedMSBuildEditorConfig.editorconfig
+apphost
+
+# NuGet
+*.nuget.props
+*.nuget.targets
+*.nuget.dgspec.json
+project.assets.json
+project.nuget.cache
+
+# --- Node.js (websocket_nodejs / adb-emulator-server) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+package-lock.json.bak
+
+# --- Secrets / local config (keep *.example templates) ---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- Logs & temp ---
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# --- Streaming / capture artifacts (large binary dumps) ---
+*.mp4
+*.h264
+*.raw
+*.mkv
+screenshots/
+captures/
+
+# --- Android / emulator binaries (if added later) ---
+*.apk
+*.aab
+*.ipa
+
+# --- Misc workspace junk ---
+cd

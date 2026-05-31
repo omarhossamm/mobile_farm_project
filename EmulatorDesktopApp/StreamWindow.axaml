@@ -1,0 +1,80 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:EmulatorDesktopApp.ViewModels"
+        x:Class="EmulatorDesktopApp.StreamWindow"
+        x:DataType="vm:StreamWindowViewModel"
+        Title="Live Stream"
+        Width="900"
+        Height="700"
+        MinWidth="480"
+        MinHeight="360"
+        WindowStartupLocation="CenterScreen"
+        Background="#000000">
+
+    <Grid RowDefinitions="Auto,*">
+        <Border Grid.Row="0"
+                Background="#1A1A1A"
+                Padding="12,8">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+                <StackPanel Grid.Column="0" Spacing="2">
+                    <TextBlock Text="{Binding SessionLabel}"
+                               FontSize="12"
+                               Foreground="#AAAAAA" />
+                    <TextBlock Text="{Binding StreamStatus}"
+                               FontSize="14"
+                               FontWeight="SemiBold"
+                               Foreground="#FFFFFF" />
+                </StackPanel>
+                <TextBlock Grid.Column="1"
+                           Grid.ColumnSpan="2"
+                           Text="{Binding MetricsText}"
+                           VerticalAlignment="Center"
+                           Margin="0,0,12,0"
+                           FontSize="11"
+                           Foreground="#88FF88" />
+                <Button Grid.Column="3"
+                        Content="Stop Stream"
+                        Command="{Binding StopStreamCommand}"
+                        Margin="0,0,8,0"
+                        Padding="16,8"
+                        CornerRadius="6"
+                        Background="#FF5722"
+                        Foreground="#FFFFFF"
+                        FontWeight="SemiBold"
+                        Cursor="Hand" />
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="1"
+                Background="#000000"
+                ClipToBounds="True">
+            <Grid>
+                <StackPanel HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            IsVisible="{Binding ShowVideoPlaceholder}"
+                            Spacing="8">
+                    <TextBlock Text="Waiting for video..."
+                               FontSize="16"
+                               Foreground="#666666"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Text="Stream is negotiating or encoding"
+                               FontSize="12"
+                               Foreground="#444444"
+                               HorizontalAlignment="Center" />
+                </StackPanel>
+                <Border x:Name="VideoSurface"
+                        HorizontalAlignment="Stretch"
+                        VerticalAlignment="Stretch"
+                        Background="Transparent"
+                        IsVisible="{Binding HasVideoFrame}">
+                    <Image x:Name="VideoImage"
+                           Source="{Binding CurrentFrame}"
+                           Stretch="Uniform"
+                           RenderOptions.BitmapInterpolationMode="None"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center" />
+                </Border>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
