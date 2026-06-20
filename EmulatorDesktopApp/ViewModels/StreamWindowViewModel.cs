@@ -22,7 +22,10 @@ namespace EmulatorDesktopApp.ViewModels
         private WriteableBitmap? _currentFrame;
         private string _streamStatus = "Connecting...";
         private bool _hasVideoFrame;
+        private bool _isVideoStalled;
         private Point? _swipeStart;
+        private DateTime _pointerDownUtc;
+        private readonly IosHomeIndicatorGestureRecognizer _iosHomeGesture = new();
         private string _metricsText = string.Empty;
         private DispatcherTimer? _metricsTimer;
         private bool _isFullscreen;
@@ -36,8 +39,8 @@ namespace EmulatorDesktopApp.ViewModels
             VolumeUpCommand   = new AsyncRelayCommand(() => SendKey("KEYCODE_VOLUME_UP"),   () => HasVideoFrame);
             VolumeDownCommand = new AsyncRelayCommand(() => SendKey("KEYCODE_VOLUME_DOWN"), () => HasVideoFrame);
             BackCommand       = new AsyncRelayCommand(() => SendKey("KEYCODE_BACK"),        () => HasVideoFrame);
-            HomeCommand       = new AsyncRelayCommand(() => SendKey("KEYCODE_HOME"),        () => HasVideoFrame);
-            RecentAppsCommand = new AsyncRelayCommand(() => SendKey("KEYCODE_APP_SWITCH"),  () => HasVideoFrame);
+            HomeCommand         = new AsyncRelayCommand(() => SendKey("KEYCODE_HOME"),        () => HasVideoFrame);
+            RecentAppsCommand   = new AsyncRelayCommand(() => SendKey("KEYCODE_APP_SWITCH"),  () => HasVideoFrame);
             ScreenshotCommand = new AsyncRelayCommand(TakeScreenshotAsync,                  () => HasVideoFrame);
 
             // Window / client-side commands — always enabled.
@@ -107,6 +110,22 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
+        /// <summary>
+        /// True while the server-side capture pipe is stalled (no frames for 500 ms+).
+        /// Drives a "buffering" overlay in the view so the user sees a spinner
+        /// rather than a silently frozen frame.
+        /// </summary>
+        public bool IsVideoStalled
+        {
+            get => _isVideoStalled;
+            private set
+            {
+                if (_isVideoStalled == value) return;
+                _isVideoStalled = value;
+                OnPropertyChanged();
+            }
+        }
+
         public bool IsFullscreen
         {
             get => _isFullscreen;
@@ -118,17 +137,56 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
-        /// <summary>
-        /// Primary header line — device id (or fallback label).
-        /// </summary>
-        public string DeviceLabel
+        public MainWindowViewModel MainViewModel => _mainViewModel;
+
+    // ── Platform-specific viewer selection ──────────────────────────────────
+    //
+    // The iOS Simulator viewer (device frame + Simulator chrome) is an entirely
+    // separate presentation path from the Android viewer. Platform is taken from
+    // the selected device (stable for the lifetime of this window), so the
+    // correct viewer is chosen before the first frame arrives. Android keeps its
+    // exact previous behaviour (IsIosViewer == false → identical bindings).
+
+    public bool IsIosViewer =>
+        string.Equals(_mainViewModel.SelectedDevice?.Platform, "ios", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(_mainViewModel.CoordinateMapper.Meta?.Platform, "ios", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Android viewer (video column + side toolbar) visibility.</summary>
+    public bool ShowAndroidViewer => !IsIosViewer;
+
+    // Android: side toolbar always shown (unchanged). iOS: hidden — the iOS
+    // viewer uses Simulator-style chrome instead.
+    public bool ShowSideToolbar => !IsIosViewer;
+
+    /// <summary>Model name shown in the iOS Simulator chrome header.</summary>
+    public string IosDeviceName
+    {
+        get
         {
-            get
-            {
-                var device = _mainViewModel.SelectedDeviceId;
-                return string.IsNullOrEmpty(device) ? "Android Emulator" : device;
-            }
+            var device = _mainViewModel.SelectedDevice;
+            if (device != null && !string.IsNullOrEmpty(device.DisplayName))
+                return device.DisplayName;
+            var id = _mainViewModel.SelectedDeviceId;
+            return string.IsNullOrEmpty(id) ? "iPhone" : id;
         }
+    }
+
+    /// <summary>Secondary line in the iOS chrome header.</summary>
+    public string IosRuntimeLabel => "iOS Simulator";
+
+    public string DeviceLabel
+    {
+        get
+        {
+            var device = _mainViewModel.SelectedDevice;
+            if (device != null && !string.IsNullOrEmpty(device.DisplayName))
+                return device.DisplayName;
+            var id = _mainViewModel.SelectedDeviceId;
+            if (!string.IsNullOrEmpty(id))
+                return id;
+            return IsIosViewer ? "iOS Simulator" : "Android Emulator";
+        }
+    }
 
         /// <summary>
         /// Short session id for the second header line.
@@ -146,47 +204,15 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
-        /// <summary>
-        /// Window title shown in the custom title bar. Mirrors the
-        /// "Android Emulator — &lt;device&gt;" format the official emulator uses.
-        /// </summary>
         public string WindowTitle
         {
             get
             {
-                var device = _mainViewModel.SelectedDeviceId;
-                return string.IsNullOrEmpty(device)
-                    ? "Android Emulator"
-                    : $"Android Emulator — {device}";
-            }
-        }
-
-        /// <summary>
-        /// Small gray subtitle rendered above <see cref="StreamStatus"/> in the
-        /// stream-window header. Shows the device id and a short session id so
-        /// the user can tell which emulator / session the mirror window is
-        /// bound to at a glance. Derived from the parent
-        /// <see cref="MainWindowViewModel"/>; both fields are stable for the
-        /// lifetime of the stream window, so no change notification is needed
-        /// (the window is closed and recreated on stop / restart).
-        /// </summary>
-        public string SessionLabel
-        {
-            get
-            {
-                var device = _mainViewModel.SelectedDeviceId;
-                var sessionId = _mainViewModel.SessionId;
-                var shortSession = string.IsNullOrEmpty(sessionId)
-                    ? string.Empty
-                    : (sessionId.Length > 8 ? sessionId.Substring(0, 8) : sessionId);
-
-                if (string.IsNullOrEmpty(device) && string.IsNullOrEmpty(shortSession))
-                    return "No active session";
-                if (string.IsNullOrEmpty(shortSession))
-                    return device!;
-                if (string.IsNullOrEmpty(device))
-                    return $"Session {shortSession}";
-                return $"{device} · session {shortSession}";
+                var device = _mainViewModel.SelectedDevice;
+                var label = device?.DisplayName ?? _mainViewModel.SelectedDeviceId;
+                if (IsIosViewer)
+                    return string.IsNullOrEmpty(label) ? "iOS Simulator" : $"iOS Simulator — {label}";
+                return string.IsNullOrEmpty(label) ? "Android Emulator" : $"Android Emulator — {label}";
             }
         }
 
@@ -209,6 +235,20 @@ namespace EmulatorDesktopApp.ViewModels
         /// <summary>Called after pixels are written so the view can InvalidateVisual.</summary>
         public Action? OnFrameUpdated { get; set; }
 
+        public bool IsShuttingDown { get; private set; }
+
+        /// <summary>Stop frame delivery before the mirror window is closed.</summary>
+        public void BeginShutdown()
+        {
+            if (IsShuttingDown)
+                return;
+
+            IsShuttingDown = true;
+            OnFrameUpdated = null;
+            CurrentFrame = null;
+            IsVideoStalled = false;
+        }
+
         /// <summary>
         /// Pushes a freshly-written bitmap to the view. The render pipeline rotates
         /// between two bitmaps so this is always a different reference and Avalonia
@@ -216,23 +256,51 @@ namespace EmulatorDesktopApp.ViewModels
         /// </summary>
         public void UpdateFrame(WriteableBitmap frame)
         {
+            if (IsShuttingDown)
+                return;
+
             CurrentFrame = frame;
             OnFrameUpdated?.Invoke();
         }
 
         public void UpdateStatus(string status) => StreamStatus = status;
 
+        /// <summary>Shown when the server signals no frames have been sent for 500 ms+.</summary>
+        public void NotifyStall() => IsVideoStalled = true;
+
+        /// <summary>Clears the stall indicator when frame delivery resumes.</summary>
+        public void NotifyStallCleared() => IsVideoStalled = false;
+
         // ── Pointer mapping ───────────────────────────────────────────────────
         //
-        // VideoImage uses Stretch="Uniform" — the picture is letterboxed inside
-        // VideoSurface. Normalizing against the full surface shifts taps toward
-        // the centre and makes the device hit the wrong list item.
+        // Android StreamWindow uses Stretch="Uniform" and letterbox-aware mapping.
 
         public Task HandlePointerPressedAsync(Point position, Size viewSize, Size videoSize)
         {
-            if (TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
+            _pointerDownUtc = DateTime.UtcNow;
+            _iosHomeGesture.Reset();
+
+            if (_mainViewModel.CoordinateMapper.TryNormalize(
+                    position, viewSize, videoSize, out var nx, out var ny))
+            {
                 _swipeStart = new Point(nx, ny);
+                if (IsIosViewer)
+                    _iosHomeGesture.Begin(nx, ny);
+            }
+
             return Task.CompletedTask;
+        }
+
+        public async Task HandlePointerMovedAsync(Point position, Size viewSize, Size videoSize)
+        {
+            if (!IsIosViewer || !_iosHomeGesture.IsActive || _iosHomeGesture.IsConsumed)
+                return;
+
+            if (!_mainViewModel.CoordinateMapper.TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
+                return;
+
+            if (_iosHomeGesture.Update(nx, ny) == IosHomeIndicatorGestureRecognizer.GestureAction.AppSwitcher)
+                await _mainViewModel.SendRemoteAppSwitcherAsync();
         }
 
         public async Task HandlePointerReleasedAsync(Point position, Size viewSize, Size videoSize)
@@ -240,9 +308,39 @@ namespace EmulatorDesktopApp.ViewModels
             if (_swipeStart is not { } start)
                 return;
 
-            if (!TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
+            if (!_mainViewModel.CoordinateMapper.TryNormalize(position, viewSize, videoSize, out var nx, out var ny))
             {
                 _swipeStart = null;
+                _iosHomeGesture.Reset();
+                return;
+            }
+
+            int gestureMs = (int)Math.Max(0, (DateTime.UtcNow - _pointerDownUtc).TotalMilliseconds);
+
+            if (IsIosViewer && !_iosHomeGesture.IsConsumed)
+            {
+                var action = _iosHomeGesture.Complete(nx, ny, gestureMs);
+                if (action == IosHomeIndicatorGestureRecognizer.GestureAction.AppSwitcher)
+                {
+                    await _mainViewModel.SendRemoteAppSwitcherAsync();
+                    _swipeStart = null;
+                    _iosHomeGesture.Reset();
+                    return;
+                }
+
+                if (action == IosHomeIndicatorGestureRecognizer.GestureAction.Home)
+                {
+                    await _mainViewModel.SendRemoteKeyAsync("KEYCODE_HOME");
+                    _swipeStart = null;
+                    _iosHomeGesture.Reset();
+                    return;
+                }
+            }
+
+            if (IsIosViewer && _iosHomeGesture.IsConsumed)
+            {
+                _swipeStart = null;
+                _iosHomeGesture.Reset();
                 return;
             }
 
@@ -253,72 +351,15 @@ namespace EmulatorDesktopApp.ViewModels
             if (dist > 0.02)
                 await _mainViewModel.SendRemoteSwipeAsync(start.X, start.Y, nx, ny);
             else
-                await _mainViewModel.SendRemoteTapAsync(nx, ny);
+                await _mainViewModel.SendRemoteTapAsync(start.X, start.Y);
 
             _swipeStart = null;
-        }
-
-        internal static bool TryNormalize(
-            Point position,
-            Size viewSize,
-            Size videoSize,
-            out double nx,
-            out double ny)
-        {
-            nx = ny = 0;
-            if (viewSize.Width <= 0 || viewSize.Height <= 0)
-                return false;
-
-            if (videoSize.Width <= 0 || videoSize.Height <= 0)
-            {
-                nx = Math.Clamp(position.X / viewSize.Width, 0, 1);
-                ny = Math.Clamp(position.Y / viewSize.Height, 0, 1);
-                return true;
-            }
-
-            if (!TryGetUniformContentRect(viewSize, videoSize, out var contentRect))
-                return false;
-
-            if (!contentRect.Contains(position))
-                return false;
-
-            nx = Math.Clamp((position.X - contentRect.X) / contentRect.Width, 0, 1);
-            ny = Math.Clamp((position.Y - contentRect.Y) / contentRect.Height, 0, 1);
-            return true;
-        }
-
-        internal static bool TryGetUniformContentRect(Size viewSize, Size videoSize, out Rect contentRect)
-        {
-            contentRect = default;
-            if (viewSize.Width <= 0 || viewSize.Height <= 0 ||
-                videoSize.Width <= 0 || videoSize.Height <= 0)
-            {
-                return false;
-            }
-
-            double videoAspect = videoSize.Width / videoSize.Height;
-            double viewAspect = viewSize.Width / viewSize.Height;
-
-            double contentWidth;
-            double contentHeight;
-            if (viewAspect > videoAspect)
-            {
-                contentHeight = viewSize.Height;
-                contentWidth = contentHeight * videoAspect;
-            }
-            else
-            {
-                contentWidth = viewSize.Width;
-                contentHeight = contentWidth / videoAspect;
-            }
-
-            double offsetX = (viewSize.Width - contentWidth) / 2;
-            double offsetY = (viewSize.Height - contentHeight) / 2;
-            contentRect = new Rect(offsetX, offsetY, contentWidth, contentHeight);
-            return true;
+            _iosHomeGesture.Reset();
         }
 
         public Task SendRemoteKeyAsync(string keyCode) => _mainViewModel.SendRemoteKeyAsync(keyCode);
+
+        public Task SendRemoteTextAsync(string text) => _mainViewModel.SendRemoteTextAsync(text);
 
         public void NotifyFrameRendered() => _mainViewModel.StreamMetrics.RecordRendered();
 
@@ -365,6 +406,12 @@ namespace EmulatorDesktopApp.ViewModels
 
         private async Task StopStreamAsync() =>
             await _mainViewModel.StopStreamFromStreamWindowAsync();
+
+        public bool ShouldStopStreamOnClose =>
+            !_mainViewModel.SuppressStopOnStreamWindowClose && _mainViewModel.IsStreaming;
+
+        public Task StopStreamOnWindowCloseAsync() =>
+            _mainViewModel.StopStreamWithoutClosingWindowAsync();
 
         private void RefreshDeviceCommandStates()
         {

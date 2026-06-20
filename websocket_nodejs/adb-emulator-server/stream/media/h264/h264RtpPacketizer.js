@@ -88,6 +88,28 @@ class H264RtpPacketizer {
     return packets;
   }
 
+  /**
+   * Rewrite the RTP timestamp and assign fresh, monotonic sequence numbers on
+   * already-serialized packets. Used when replaying pre-gate-buffered frames
+   * after the startup gate opens: their original timestamp/sequence were
+   * assigned before the bootstrap STAP-A, so without re-stamping the receiver
+   * would see the sequence/timestamp jump backwards and drop the frame.
+   *
+   * @param {Buffer[]} packets  RTP packets (12-byte header + payload)
+   * @param {number} timestamp  fresh 90 kHz RTP timestamp
+   * @returns {Buffer[]} the same packets, mutated in place
+   */
+  restamp(packets, timestamp) {
+    if (!packets || packets.length === 0) return packets;
+    for (const pkt of packets) {
+      if (!pkt || pkt.length < 12) continue;
+      pkt.writeUInt16BE(this.sequenceNumber & 0xffff, 2);
+      this.sequenceNumber = (this.sequenceNumber + 1) & 0xffff;
+      pkt.writeUInt32BE(timestamp >>> 0, 4);
+    }
+    return packets;
+  }
+
   /** @private */
   _buildPacket(payload, timestamp, marker) {
     const rtp = Buffer.alloc(12 + payload.length);

@@ -7,6 +7,7 @@ using EmulatorDesktopApp.ViewModels.Commands;
 using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -46,6 +47,12 @@ namespace EmulatorDesktopApp.ViewModels
         private bool _isRefreshingDevices;
         private string _streamStatus = "No stream";
         private bool _isStreaming;
+        private bool _ignoreStreamStoppedResponses;
+        private bool _suppressStopOnStreamWindowClose;
+        private bool _isStoppingStream;
+        private string? _sessionBoundDeviceId;
+        private string? _sessionBoundAvdName;
+
         #region Constructor
 
         public MainWindowViewModel(
@@ -57,6 +64,7 @@ namespace EmulatorDesktopApp.ViewModels
             _webSocketService = new WebSocketService();
             _mirror = new MirrorSession(AppendLog);
             _remoteControl = new RemoteControlService(_webSocketService);
+            _remoteControl.AttachWebRtc(_mirror.WebRtc);
 
             // Subscribe to WebSocket events
             _webSocketService.OnMessageReceived += HandleMessageReceived;
@@ -76,7 +84,12 @@ namespace EmulatorDesktopApp.ViewModels
                 StreamMetrics.RecordQueueDrop((int)_mirror.Render.SkippedBeforeRender);
                 _mirror.Render.SubmitDecoded(raw);
             };
-            _mirror.WebRtc.OnSceneCut = () => _mirror.Render.OnSceneCut();
+            _mirror.WebRtc.OnSceneCut = () =>
+            {
+                if (_isStoppingStream)
+                    return;
+                _mirror.Render.OnSceneCut();
+            };
 
             // Initialize device collection
             Devices = new ObservableCollection<DeviceOption>();
@@ -89,7 +102,7 @@ namespace EmulatorDesktopApp.ViewModels
             DestroySessionCommand = new AsyncRelayCommand(ExecuteDestroySessionAsync, CanExecuteDestroySession);
             StartStreamCommand = new AsyncRelayCommand(ExecuteStartStreamAsync, CanExecuteStartStream);
             StopStreamCommand = new AsyncRelayCommand(ExecuteStopStreamAsync, CanExecuteStopStream);
-            ClearLogsCommand = new RelayCommand(ExecuteClearLogs);
+            ClearLogsCommand = new RelayCommand(ExecuteClearLogs, CanExecuteClearLogs);
 
             // Add initial log message
             AppendLog("Application started. Enter WebSocket URL and click Connect.");
@@ -116,6 +129,8 @@ namespace EmulatorDesktopApp.ViewModels
                 }
             }
         }
+
+        private int _logsNotifyScheduled;
 
         /// <summary>
         /// The accumulated log messages displayed in the UI.
@@ -198,9 +213,36 @@ namespace EmulatorDesktopApp.ViewModels
                     _selectedDevice = value;
                     OnPropertyChanged();
                     OnPropertyChanged(nameof(SelectedDeviceId));
-                    (CreateSessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-                    (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                    OnPropertyChanged(nameof(IsSessionDeviceSelected));
+                    RaiseSessionCommandCanExecuteChanged();
                 }
+            }
+        }
+
+        /// <summary>
+        /// True when no session is active, or the dropdown matches the bound session device.
+        /// When false, only Destroy Session should be available.
+        /// </summary>
+        public bool IsSessionDeviceSelected
+        {
+            get
+            {
+                if (!HasDeviceSession || SelectedDevice == null)
+                    return true;
+
+                if (!string.IsNullOrEmpty(_sessionBoundDeviceId) &&
+                    string.Equals(SelectedDevice.Id, _sessionBoundDeviceId, StringComparison.Ordinal))
+                    return true;
+
+                if (!string.IsNullOrEmpty(_sessionBoundAvdName))
+                {
+                    if (string.Equals(SelectedDevice.AvdName, _sessionBoundAvdName, StringComparison.Ordinal))
+                        return true;
+                    if (string.Equals(SelectedDevice.Id, _sessionBoundAvdName, StringComparison.Ordinal))
+                        return true;
+                }
+
+                return false;
             }
         }
 
@@ -243,11 +285,16 @@ namespace EmulatorDesktopApp.ViewModels
                 _hasDeviceSession = value;
                 OnPropertyChanged();
                 OnPropertyChanged(nameof(SessionStatus));
-                (CreateSessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-                (DestroySessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
-                (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                OnPropertyChanged(nameof(IsSessionDeviceSelected));
+                RaiseSessionCommandCanExecuteChanged();
             }
         }
+
+        /// <summary>Coordinate mapping for the active stream (from stream_meta).</summary>
+        public CoordinateMapper CoordinateMapper => _mirror.Coordinates;
+
+        public void UpdateStreamDimensions(int streamW, int streamH) =>
+            _mirror.UpdateStreamDimensions(streamW, streamH);
 
         /// <summary>
         /// Human-readable session status for display (truncated for UI).
@@ -318,6 +365,12 @@ namespace EmulatorDesktopApp.ViewModels
         }
 
         /// <summary>
+        /// While true, closing the mirror window must not tear down an active stream.
+        /// Used when replacing the window during Start Stream.
+        /// </summary>
+        internal bool SuppressStopOnStreamWindowClose => _suppressStopOnStreamWindowClose;
+
+        /// <summary>
         /// Color for the stream status indicator (green when streaming, red when not).
         /// </summary>
         public Avalonia.Media.Color StreamStatusColor => _isStreaming 
@@ -341,7 +394,22 @@ namespace EmulatorDesktopApp.ViewModels
 
         #region Command Implementations
 
-        private bool CanExecuteConnect() => !IsConnected && !IsConnecting && !string.IsNullOrWhiteSpace(WebSocketUrl);
+        private void RaiseSessionCommandCanExecuteChanged()
+        {
+            (ConnectCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (DisconnectCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (RefreshDevicesCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (CreateSessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (DestroySessionCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (StopStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+            (ClearLogsCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
+        private bool SessionCommandsEnabled => !HasDeviceSession || IsSessionDeviceSelected;
+
+        private bool CanExecuteConnect() =>
+            SessionCommandsEnabled && !IsConnected && !IsConnecting && !string.IsNullOrWhiteSpace(WebSocketUrl);
 
         private async Task ExecuteConnectAsync()
         {
@@ -366,7 +434,7 @@ namespace EmulatorDesktopApp.ViewModels
             }
         }
 
-        private bool CanExecuteDisconnect() => IsConnected && !IsConnecting;
+        private bool CanExecuteDisconnect() => SessionCommandsEnabled && IsConnected && !IsConnecting;
 
         private async Task ExecuteDisconnectAsync()
         {
@@ -384,11 +452,17 @@ namespace EmulatorDesktopApp.ViewModels
 
         private void ExecuteClearLogs()
         {
+            if (!CanExecuteClearLogs())
+                return;
+
             Logs = string.Empty;
             AppendLog("Logs cleared");
         }
 
-        private bool CanExecuteRefreshDevices() => IsConnected && !IsRefreshingDevices;
+        private bool CanExecuteClearLogs() => SessionCommandsEnabled;
+
+        private bool CanExecuteRefreshDevices() =>
+            SessionCommandsEnabled && IsConnected && !IsRefreshingDevices;
 
         private async Task ExecuteRefreshDevicesAsync()
         {
@@ -407,7 +481,7 @@ namespace EmulatorDesktopApp.ViewModels
         }
 
         private bool CanExecuteCreateSession() =>
-            IsConnected && SelectedDevice != null && !HasDeviceSession;
+            SessionCommandsEnabled && IsConnected && SelectedDevice != null && !HasDeviceSession;
 
         private async Task ExecuteCreateSessionAsync()
         {
@@ -470,6 +544,7 @@ namespace EmulatorDesktopApp.ViewModels
             if (!IsConnected)
             {
                 HasDeviceSession = false;
+                ClearSessionBinding();
                 return;
             }
 
@@ -489,6 +564,23 @@ namespace EmulatorDesktopApp.ViewModels
                 AppendLog("[SESSION] Failed to send destroy session command");
 
             HasDeviceSession = false;
+            ClearSessionBinding();
+        }
+
+        private void ClearSessionBinding()
+        {
+            _sessionBoundDeviceId = null;
+            _sessionBoundAvdName = null;
+            OnPropertyChanged(nameof(IsSessionDeviceSelected));
+            RaiseSessionCommandCanExecuteChanged();
+        }
+
+        private void BindSessionDevice(string? deviceId, string? avdName)
+        {
+            _sessionBoundDeviceId = deviceId;
+            _sessionBoundAvdName = avdName;
+            OnPropertyChanged(nameof(IsSessionDeviceSelected));
+            RaiseSessionCommandCanExecuteChanged();
         }
 
         private void ResetLocalSessionState()
@@ -504,6 +596,7 @@ namespace EmulatorDesktopApp.ViewModels
             CloseStreamWindow();
             HasDeviceSession = false;
             SessionId = string.Empty;
+            ClearSessionBinding();
         }
 
         private void RefreshAllCommandStates()
@@ -520,6 +613,7 @@ namespace EmulatorDesktopApp.ViewModels
         #region Stream Commands
 
         private bool CanExecuteStartStream() =>
+            SessionCommandsEnabled &&
             IsConnected && HasDeviceSession && SelectedDevice?.IsOnline == true && !IsStreaming;
 
         private async Task ExecuteStartStreamAsync()
@@ -536,51 +630,96 @@ namespace EmulatorDesktopApp.ViewModels
                 return;
             }
 
+            // Ignore stale stream_stopped from a previous session while this start is in flight.
+            _ignoreStreamStoppedResponses = true;
+
+            if (IsStreaming)
+                await StopStreamWithoutClosingWindowAsync();
+
+            // ── Reset ALL state from the previous stream session ──────────────
+            _mirror.ResetForNewStream();
+            AppendLog("[STREAM] State reset — starting fresh session");
+            // ─────────────────────────────────────────────────────────────────
+
             AppendLog($"[STREAM] Starting stream for session: {SessionId}...");
             StreamStatus = "Starting...";
             _mirror.WebRtc.SetSignalingRelay(false);
-            OpenStreamWindow();
 
-            // Prepare WebRTC client
+            // Replacing the mirror window must not send stop_stream to the server.
+            _suppressStopOnStreamWindowClose = true;
+            try
+            {
+                OpenStreamWindow();
+            }
+            finally
+            {
+                _suppressStopOnStreamWindowClose = false;
+            }
+
             await _mirror.WebRtc.PrepareStreamAsync(SessionId);
 
-            // Send start_stream message to server
             var message = WebRTCClient.CreateStartStreamMessage(SessionId, SelectedDeviceId ?? "");
             var success = await _webSocketService.SendMessageAsync(message);
 
             if (!success)
             {
+                _ignoreStreamStoppedResponses = false;
                 AppendLog("[ERROR] Failed to send start stream command");
                 StreamStatus = "Error";
             }
         }
 
-        private bool CanExecuteStopStream() => IsConnected && IsStreaming;
+        private bool CanExecuteStopStream() =>
+            SessionCommandsEnabled && IsConnected && IsStreaming;
 
-        private async Task ExecuteStopStreamAsync()
+        private async Task StopStreamCoreAsync()
         {
+            if (string.IsNullOrEmpty(SessionId) || !IsStreaming)
+                return;
+
             AppendLog($"[STREAM] Stopping stream for session: {SessionId}...");
             StreamStatus = "Stopping...";
+
+            // Detach the render pipeline before WebRTC teardown so late scene_cut /
+            // decode callbacks cannot touch a closing mirror window.
+            _streamWindowViewModel?.BeginShutdown();
+            await _mirror.DetachStreamWindowAsync();
+            ClearStreamBitmap();
+
             _mirror.WebRtc.SetSignalingRelay(false);
 
-            // Send stop_stream message to server
             var message = WebRTCClient.CreateStopStreamMessage(SessionId);
             var success = await _webSocketService.SendMessageAsync(message);
 
             if (!success)
-            {
                 AppendLog("[ERROR] Failed to send stop stream command");
-            }
 
-            // Stop WebRTC client
             _mirror.WebRtc.StopStream();
-            ClearStreamBitmap();
-            CloseStreamWindow();
+            IsStreaming = false;
         }
 
-        /// <summary>
-        /// Called from the stream window Stop button.
-        /// </summary>
+        private async Task ExecuteStopStreamAsync()
+        {
+            _isStoppingStream = true;
+            try
+            {
+                await StopStreamCoreAsync();
+                CloseStreamWindow(renderAlreadyDetached: true);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[ERROR] Stop stream failed: {ex.Message}");
+            }
+            finally
+            {
+                _isStoppingStream = false;
+            }
+        }
+
+        /// <summary>Stop an active stream without closing the mirror window.</summary>
+        public Task StopStreamWithoutClosingWindowAsync() => StopStreamCoreAsync();
+
+        /// <summary>Called from the stream window Stop button.</summary>
         public Task StopStreamFromStreamWindowAsync() => ExecuteStopStreamAsync();
 
         #endregion
@@ -602,11 +741,12 @@ namespace EmulatorDesktopApp.ViewModels
                 {
                     using var doc = JsonDocument.Parse(message);
                     var root = doc.RootElement;
+                    string? msgType = null;
 
                     // Handle specific message types
                     if (root.TryGetProperty("type", out var typeElement))
                     {
-                        var msgType = typeElement.GetString();
+                        msgType = typeElement.GetString();
 
                         // Handle device list response (supports: devices_list, get_devices_response)
                         if ((msgType == "devices_list" || msgType == "get_devices_response" || msgType == "list_devices_response") && 
@@ -704,6 +844,7 @@ namespace EmulatorDesktopApp.ViewModels
                                 {
                                     SessionId = sessionId;
                                     HasDeviceSession = true;
+                                    BindSessionDevice(boundDeviceId, emulatorName);
                                     AppendLog($"[INFO] Session created: {SessionId}");
 
                                     MarkDeviceOnline(boundDeviceId, emulatorName);
@@ -717,8 +858,21 @@ namespace EmulatorDesktopApp.ViewModels
                         // Handle session destroyed response
                         if (msgType == "session_destroyed")
                         {
+                            string? destroyedDeviceId = null;
+                            if (root.TryGetProperty("data", out var destroyedData) &&
+                                destroyedData.TryGetProperty("device_id", out var destroyedDeviceElement))
+                            {
+                                destroyedDeviceId = destroyedDeviceElement.GetString();
+                            }
+
                             HasDeviceSession = false;
+                            ClearSessionBinding();
                             AppendLog("[INFO] Session destroyed");
+
+                            if (!string.IsNullOrEmpty(destroyedDeviceId))
+                                MarkDeviceOffline(destroyedDeviceId);
+
+                            _ = ExecuteRefreshDevicesAsync();
                         }
 
                         // Handle session error
@@ -730,6 +884,8 @@ namespace EmulatorDesktopApp.ViewModels
                         // Handle stream started response - may contain WebRTC offer
                         if (msgType == "stream_started")
                         {
+                            _ignoreStreamStoppedResponses = false;
+
                             if (root.TryGetProperty("success", out var successElement) && !successElement.GetBoolean())
                             {
                                 var errorText = root.TryGetProperty("error", out var errElement)
@@ -751,6 +907,19 @@ namespace EmulatorDesktopApp.ViewModels
 
                                 if (ServerMessageJson.TryGetMessageData(root, out var streamData))
                                 {
+                                    if (streamData.TryGetProperty("stream_meta", out var metaEl))
+                                    {
+                                        var meta = StreamMeta.TryParse(metaEl);
+                                        _mirror.ApplyStreamMeta(meta);
+                                        if (meta != null)
+                                        {
+                                            AppendLog(
+                                                $"[STREAM] stream_meta stream={meta.StreamWidth}x{meta.StreamHeight} " +
+                                                $"device={meta.DeviceLogicalWidth}x{meta.DeviceLogicalHeight} " +
+                                                $"provider={meta.Provider}");
+                                        }
+                                    }
+
                                     if (ServerMessageJson.TryExtractSdpOffer(streamData, out var sdpOffer))
                                     {
                                         AppendLog("[SIGNALING] WebRTC offer found in stream_started, processing...");
@@ -767,6 +936,12 @@ namespace EmulatorDesktopApp.ViewModels
                         // Handle stream stopped response
                         if (msgType == "stream_stopped")
                         {
+                            if (_ignoreStreamStoppedResponses)
+                            {
+                                AppendLog("[STREAM] Stream stopped (ignored — new start in progress)");
+                                return;
+                            }
+
                             AppendLog("[STREAM] Stream stopped");
                             IsStreaming = false;
                             _mirror.WebRtc.SetSignalingRelay(false);
@@ -832,46 +1007,62 @@ namespace EmulatorDesktopApp.ViewModels
                             AppendLog($"[SIGNALING ERROR] {iceErr}");
                         }
 
-                        if (msgType == "scene_cut")
+                        if (msgType == "scene_cut" && !_isStoppingStream)
                             _mirror.WebRtc.NotifySceneCut();
 
-                        // Screenshot result: report the saved path on success.
+                        // Screenshot result: save PNG to the local Desktop.
                         if (msgType == "screenshot_taken" &&
-                            root.TryGetProperty("success", out var shotOk) &&
-                            shotOk.GetBoolean() &&
-                            ServerMessageJson.TryGetMessageData(root, out var shotData))
+                            root.TryGetProperty("success", out var shotOk))
                         {
-                            string? savedPath = null;
-                            if (shotData.TryGetProperty("path", out var pathEl))
-                                savedPath = pathEl.GetString();
-                            else if (shotData.TryGetProperty("local_path", out var localPathEl))
-                                savedPath = localPathEl.GetString();
+                            if (shotOk.GetBoolean())
+                            {
+                                if (ServerMessageJson.TryGetMessageData(root, out var shotData))
+                                    TrySaveScreenshotToDesktop(shotData);
+                                else
+                                    TrySaveScreenshotToDesktop(root);
+                            }
+                            else
+                            {
+                                var shotErr = root.TryGetProperty("error", out var shotErrEl)
+                                    ? shotErrEl.GetString()
+                                    : "Screenshot failed";
+                                AppendLog($"[SCREENSHOT] {shotErr}");
+                            }
+                        }
 
-                            if (!string.IsNullOrEmpty(savedPath))
-                                AppendLog($"[SCREENSHOT] Saved → {savedPath}");
+                        // Capture stall / resume notifications
+                        if (msgType == "stream_stall")
+                        {
+                            _streamWindowViewModel?.NotifyStall();
+                        }
+                        else if (msgType == "stream_resumed")
+                        {
+                            _streamWindowViewModel?.NotifyStallCleared();
                         }
 
                         // Handle stream error (legacy) and typed error responses
                         if (msgType == "stream_error" ||
                             (msgType != null && msgType.EndsWith("_error", StringComparison.Ordinal)))
                         {
+                            _ignoreStreamStoppedResponses = false;
+
                             var errorText = root.TryGetProperty("error", out var streamErrorElement)
                                 ? streamErrorElement.GetString()
-                                : "Unknown error";
-                            AppendLog($"[STREAM ERROR] {errorText}");
+                                : root.TryGetProperty("message", out var msgEl)
+                                    ? msgEl.GetString()
+                                    : "Unknown error";
+
                             IsStreaming = false;
+                            _mirror.WebRtc.SetSignalingRelay(false);
+                            AppendLog($"[STREAM ERROR] {errorText}");
                             StreamStatus = "Error";
                         }
                     }
 
-                    // Echo the raw payload (capped). The previous path
-                    // pretty-printed every message with a freshly-allocated
-                    // `JsonSerializerOptions { WriteIndented = true }`, which
-                    // both bypassed System.Text.Json's per-options metadata
-                    // cache and produced 5–20 KB of UI-thread string churn
-                    // per message during ICE / scene-cut bursts — measurable
-                    // mirror stutter.
-                    AppendLog(TruncateForLog(message, "[RECEIVED]"));
+                    // Echo the raw payload (capped). Skip types that already have
+                    // dedicated handler logs or are high-frequency during streaming.
+                    if (!ShouldSkipReceivedEcho(msgType))
+                        AppendLog(TruncateForLog(message, "[RECEIVED]"));
                 }
                 catch (JsonException)
                 {
@@ -1049,6 +1240,12 @@ namespace EmulatorDesktopApp.ViewModels
         public Task SendRemoteKeyAsync(string keyCode) =>
             _remoteControl.SendKeyAsync(keyCode);
 
+        public Task SendRemoteTextAsync(string text) =>
+            _remoteControl.SendTextAsync(text);
+
+        public Task SendRemoteAppSwitcherAsync() =>
+            _remoteControl.SendAppSwitcherAsync();
+
         /// <summary>
         /// Send a raw adb-shell command for emulator-style buttons that don't
         /// map cleanly to a single keycode. Uses the gateway's existing
@@ -1087,7 +1284,7 @@ namespace EmulatorDesktopApp.ViewModels
         /// </summary>
         public async Task SendScreenshotAsync(string localPath)
         {
-            if (!_webSocketService.IsConnected || string.IsNullOrWhiteSpace(localPath))
+            if (!_webSocketService.IsConnected)
                 return;
 
             var payload = new
@@ -1105,12 +1302,65 @@ namespace EmulatorDesktopApp.ViewModels
                 if (!ok)
                     AppendLog("[SCREENSHOT] Failed to send screenshot request");
                 else
-                    AppendLog($"[SCREENSHOT] Requested → {localPath}");
+                    AppendLog("[SCREENSHOT] Capture requested…");
             }
             catch (Exception ex)
             {
                 AppendLog($"[SCREENSHOT] {ex.Message}");
             }
+        }
+
+        private void TrySaveScreenshotToDesktop(JsonElement shotData)
+        {
+            try
+            {
+                if (!TryGetScreenshotPayload(shotData, out var b64, out var fileName))
+                {
+                    AppendLog("[SCREENSHOT] No image data in server response");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(b64))
+                {
+                    AppendLog("[SCREENSHOT] Empty image data in server response");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(fileName))
+                    fileName = $"emustream_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+
+                var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                if (string.IsNullOrWhiteSpace(desktop))
+                    desktop = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+                var fullPath = Path.Combine(desktop, fileName);
+                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+                File.WriteAllBytes(fullPath, Convert.FromBase64String(b64));
+                AppendLog($"[SCREENSHOT] Saved → {fullPath}");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[SCREENSHOT] Save failed: {ex.Message}");
+            }
+        }
+
+        private static bool TryGetScreenshotPayload(JsonElement root, out string? base64, out string? fileName)
+        {
+            base64 = null;
+            fileName = null;
+
+            JsonElement meta = root;
+            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
+                meta = data;
+
+            if (!meta.TryGetProperty("image_base64", out var b64El))
+                return false;
+
+            base64 = b64El.GetString();
+            if (meta.TryGetProperty("filename", out var fnEl))
+                fileName = fnEl.GetString();
+
+            return true;
         }
 
         /// <summary>
@@ -1178,6 +1428,12 @@ namespace EmulatorDesktopApp.ViewModels
             var avdName = device.TryGetProperty("avd_name", out var avdElement)
                 ? avdElement.GetString()
                 : null;
+            var platform = device.TryGetProperty("platform", out var platformElement)
+                ? platformElement.GetString() ?? "android"
+                : "android";
+            var targetClass = device.TryGetProperty("target_class", out var targetClassElement)
+                ? targetClassElement.GetString() ?? "device"
+                : "device";
 
             return new DeviceOption
             {
@@ -1185,7 +1441,9 @@ namespace EmulatorDesktopApp.ViewModels
                 DisplayName = name,
                 Status = status,
                 Kind = kind,
-                AvdName = avdName
+                AvdName = avdName,
+                Platform = platform,
+                TargetClass = targetClass
             };
         }
 
@@ -1229,7 +1487,9 @@ namespace EmulatorDesktopApp.ViewModels
                     DisplayName = !string.IsNullOrEmpty(avdName) ? avdName : entry.DisplayName,
                     Status = "online",
                     Kind = entry.Kind == "avd" ? "emulator" : entry.Kind,
-                    AvdName = avdName ?? entry.AvdName
+                    AvdName = avdName ?? entry.AvdName,
+                    Platform = entry.Platform,
+                    TargetClass = entry.TargetClass
                 };
                 Devices[i] = online;
                 updatedSelection = online;
@@ -1250,10 +1510,48 @@ namespace EmulatorDesktopApp.ViewModels
                 DisplayName = avdName ?? deviceId,
                 Status = "online",
                 Kind = "emulator",
-                AvdName = avdName
+                AvdName = avdName,
+                Platform = SelectedDevice?.Platform ?? "android",
+                TargetClass = SelectedDevice?.TargetClass ?? "device"
             };
             Devices.Add(created);
             SelectedDevice = created;
+        }
+
+        private void MarkDeviceOffline(string? deviceId)
+        {
+            if (string.IsNullOrEmpty(deviceId))
+                return;
+
+            for (var i = Devices.Count - 1; i >= 0; i--)
+            {
+                var entry = Devices[i];
+                if (entry.Id != deviceId && entry.AvdName != deviceId)
+                    continue;
+
+                if (entry.Kind is "emulator" or "simulator" or "device")
+                {
+                    var wasSelected = SelectedDevice?.Id == deviceId || SelectedDevice?.AvdName == deviceId;
+                    Devices.RemoveAt(i);
+                    if (wasSelected)
+                        SelectedDevice = Devices.Count > 0 ? Devices[0] : null;
+                    continue;
+                }
+
+                var offline = new DeviceOption
+                {
+                    Id = entry.Id,
+                    DisplayName = entry.DisplayName,
+                    Status = "offline",
+                    Kind = entry.Kind,
+                    AvdName = entry.AvdName,
+                    Platform = entry.Platform,
+                    TargetClass = entry.TargetClass
+                };
+                Devices[i] = offline;
+                if (SelectedDevice?.Id == deviceId)
+                    SelectedDevice = offline;
+            }
         }
 
         private void OpenStreamWindow()
@@ -1265,13 +1563,27 @@ namespace EmulatorDesktopApp.ViewModels
             _openStreamWindow?.Invoke(_streamWindowViewModel);
         }
 
-        private void CloseStreamWindow()
+        private void CloseStreamWindow(bool renderAlreadyDetached = false)
         {
-            _mirror.DetachStreamWindow();
-            _streamWindowViewModel?.StopMetricsTimer();
+            DetachStreamWindowViewModel(detachRender: !renderAlreadyDetached);
             _closeStreamWindow?.Invoke();
+        }
+
+        /// <summary>Called when the user closes the mirror window via the window chrome.</summary>
+        public void NotifyStreamWindowClosed() => DetachStreamWindowViewModel();
+
+        private void DetachStreamWindowViewModel(bool detachRender = true)
+        {
+            _streamWindowViewModel?.BeginShutdown();
+
+            if (detachRender)
+                _mirror.DetachStreamWindow();
+
+            _streamWindowViewModel?.StopMetricsTimer();
+
+            if (_streamWindowViewModel != null)
+                _streamWindowViewModel.OnFrameUpdated = null;
             _streamWindowViewModel = null;
-            ClearStreamBitmap();
         }
 
         private void ClearStreamBitmap() => _mirror.Render.ClearBitmap();
@@ -1296,9 +1608,8 @@ namespace EmulatorDesktopApp.ViewModels
             var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
             var logEntry = $"[{timestamp}] {message}";
 
-            // Stdout mirror is best-effort and never on the UI thread.
-            try { Task.Run(() => { try { Console.WriteLine(logEntry); } catch { } }); }
-            catch { /* thread-pool unavailable: drop the mirror, keep the panel */ }
+            try { Console.WriteLine(logEntry); }
+            catch { /* stdout unavailable */ }
 
             string next;
             if (string.IsNullOrEmpty(_logs))
@@ -1317,8 +1628,34 @@ namespace EmulatorDesktopApp.ViewModels
                 next = LogTruncationMarker + next.Substring(trimFrom);
             }
 
-            Logs = next;
+            if (_logs == next)
+                return;
+
+            _logs = next;
+            ScheduleLogsNotify();
         }
+
+        /// <summary>
+        /// Coalesce log panel refreshes so bursts (ICE, scene_cut, control) do not
+        /// re-render the full bound text on every single line.
+        /// </summary>
+        private void ScheduleLogsNotify()
+        {
+            if (Interlocked.CompareExchange(ref _logsNotifyScheduled, 1, 0) != 0)
+                return;
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                Interlocked.Exchange(ref _logsNotifyScheduled, 0);
+                OnPropertyChanged(nameof(Logs));
+            }, DispatcherPriority.Background);
+        }
+
+        private static bool ShouldSkipReceivedEcho(string? msgType) =>
+            msgType is "ice_candidate"
+                or "ice_candidate_received"
+                or "peer_connected"
+                or "webrtc_answer_received";
 
         private const int MaxReceivedPayloadChars = 800;
 

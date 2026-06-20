@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Dependency-free parity harness: validates the C# GeometryModel against the
+    SAME shared vectors the server's node:test suite uses, so the touch
+    transform is provably identical on both ends.
+    Run via: dotnet run on this project.
+
+    NOTE: lives OUTSIDE EmulatorDesktopApp so the app's SDK glob never compiles
+    this project's sources or generated obj files.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>GeometryParity</AssemblyName>
+    <RootNamespace>GeometryParity</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Link the production geometry math directly — no copy, no drift. -->
+    <Compile Include="../../EmulatorDesktopApp/Services/GeometryModel.cs" />
+  </ItemGroup>
+
+</Project>

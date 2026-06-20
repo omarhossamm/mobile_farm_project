@@ -24,7 +24,11 @@ namespace EmulatorDesktopApp.Services
             if (rawImage == null || rawImage.Width <= 0 || rawImage.Height <= 0)
                 return new VideoFrameInfo();
 
-            int stride = rawImage.Stride > 0 ? rawImage.Stride : rawImage.Width * 3;
+            int stride = rawImage.Stride > 0
+                ? rawImage.Stride
+                : rawImage.PixelFormat == VideoPixelFormatsEnum.Bgra
+                    ? rawImage.Width * 4
+                    : rawImage.Width * 3;
             int byteCount = stride * rawImage.Height;
             if (byteCount <= 0)
                 return new VideoFrameInfo();

@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SIPSorcery.Net;
@@ -22,9 +23,67 @@ namespace EmulatorDesktopApp.Services
     /// </summary>
     public class WebRTCClient : IDisposable
     {
-        private static bool _loggingInitialized;
-        private static bool _ffmpegInitialized;
-        private bool _disposed;
+    /// <summary>
+    /// Intercepts FFmpeg internal log messages routed through SIPSorceryMedia.FFmpeg's
+    /// ILogger sink.  One static instance is shared across all sessions (FFmpegInit is
+    /// called once per process); per-session counts are reset via
+    /// <see cref="ResetForSession"/>.
+    /// </summary>
+    private sealed class AbDiagnosticsLogger : ILogger
+    {
+        private int _concealmentFrames;
+        private int _ffmpegErrors;
+        private int _ffmpegWarnings;
+
+        public int ConcealmentFrames => Volatile.Read(ref _concealmentFrames);
+        public int FfmpegErrors      => Volatile.Read(ref _ffmpegErrors);
+        public int FfmpegWarnings    => Volatile.Read(ref _ffmpegWarnings);
+
+        /// <summary>Forward filtered FFmpeg messages to the UI log (set per session).</summary>
+        public Action<string>? Sink { get; set; }
+
+        public void ResetForSession()
+        {
+            Interlocked.Exchange(ref _concealmentFrames, 0);
+            Interlocked.Exchange(ref _ffmpegErrors, 0);
+            Interlocked.Exchange(ref _ffmpegWarnings, 0);
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (!IsEnabled(logLevel)) return;
+            var msg = formatter(state, exception);
+            if (msg.Contains("concealing", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("no frame!", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("non-existing PPS", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("co located POCs", StringComparison.OrdinalIgnoreCase))
+            {
+                Interlocked.Increment(ref _concealmentFrames);
+                Sink?.Invoke($"[FFMPEG] {msg.Trim()}");
+            }
+            else if (logLevel >= LogLevel.Error)
+            {
+                Interlocked.Increment(ref _ffmpegErrors);
+                Sink?.Invoke($"[FFMPEG-ERR] {msg.Trim()}");
+            }
+            else
+            {
+                Interlocked.Increment(ref _ffmpegWarnings);
+            }
+        }
+    }
+
+    /// <summary>Singleton FFmpeg log interceptor — shared for the process lifetime.</summary>
+    private static readonly AbDiagnosticsLogger _diagLogger = new();
+
+    private static bool _loggingInitialized;
+    private static bool _ffmpegInitialized;
+    private bool _disposed;
         private RTCPeerConnection? _peerConnection;
         private FFmpegVideoEndPoint? _videoEndPoint;
         private string? _currentSessionId;
@@ -73,8 +132,41 @@ namespace EmulatorDesktopApp.Services
         private long _mediaWatchStartedTicks;
         private long _firstFrameTicks;
         private Action<RTCIceCandidate>? _onIceCandidateHandler;
+        private int _iceCandidateLogCount;
         private volatile bool _signalingRelayEnabled;
         private readonly List<string> _pendingOutboundIce = new();
+        private readonly SemaphoreSlim _offerNegotiationLock = new(1, 1);
+        private bool _loggedNonPrimaryVideoStream;
+        private RtpVideoFramer? _unifiedH264Framer;
+        private int _videoRtpPacketsReceived;
+
+        private RTCDataChannel? _controlChannel;
+
+        // ── A/B provider comparison diagnostics ─────────────────────────────
+        private Timer? _statsTimer;
+        private long   _firstDecodedFrameTicks;
+        private long   _statsSessionStartTicks;
+
+        // ── Scene-cut watchdog ───────────────────────────────────────────────
+        //
+        // When NotifySceneCut() sets _dropDecodedUntilIdr = true, every decoded
+        // frame is dropped until the next accepted IDR picture arrives.  This
+        // is correct for the normal case (IDR follows within 0.5 s given the
+        // server's gopFrames = fps/2 setting).
+        //
+        // However, if the server stalls (network hiccup, encoder restart) after
+        // the scene-cut hint, no IDR may arrive for several seconds — leaving
+        // _dropDecodedUntilIdr permanently true and the screen frozen/black.
+        //
+        // The watchdog fires SCENE_CUT_WATCHDOG_SEC after the last scene-cut.
+        // If _dropDecodedUntilIdr is still true at that point it resets the
+        // flag so the next decoded frame (even a P-frame) is presented, giving
+        // the user a visible picture while waiting for the next clean IDR.
+        // This is a graceful-degradation path: a brief artifact is far less
+        // disruptive than an indefinite black screen.
+        private Timer?  _sceneCutWatchdog;
+        private long    _sceneCutActivatedTicks;
+        private const double SceneCutWatchdogSec = 5.0;
 
         private static void EnsureLoggingInitialized()
         {
@@ -115,10 +207,19 @@ namespace EmulatorDesktopApp.Services
 
             EnsureLoggingInitialized();
             var libPath = ResolveFfmpegLibPath();
+
+            // Pass _diagLogger so FFmpeg internal warnings (e.g. "concealing N
+            // DC, AC, MV errors in I frame") are intercepted and counted for
+            // the A/B provider comparison instead of being silently discarded.
             if (libPath != null)
-                FFmpegInit.Initialise(libPath: libPath);
+                FFmpegInit.Initialise(
+                    logLevel: FfmpegLogLevelEnum.AV_LOG_WARNING,
+                    libPath: libPath,
+                    appLogger: _diagLogger);
             else
-                FFmpegInit.Initialise();
+                FFmpegInit.Initialise(
+                    logLevel: FfmpegLogLevelEnum.AV_LOG_WARNING,
+                    appLogger: _diagLogger);
 
             _ffmpegInitialized = true;
         }
@@ -132,9 +233,10 @@ namespace EmulatorDesktopApp.Services
         public event Action<string>? OnError;
 
         public bool IsPeerInitialized => _peerConnection != null;
-        public bool IsSignalingRelayEnabled => _signalingRelayEnabled;
         public string? CurrentSessionId => _currentSessionId;
         public RTCPeerConnectionState? ConnectionState => _peerConnection?.connectionState;
+        public bool ControlDataChannelReady =>
+            _controlChannel?.readyState == RTCDataChannelState.open;
 
         /// <summary>
         /// When false, local ICE is queued until relay is enabled (after stream_started / setLocalDescription).
@@ -174,6 +276,7 @@ namespace EmulatorDesktopApp.Services
 
                 _currentSessionId = sessionId;
                 _hasRemoteDescription = false;
+                _controlChannel = null;
                 _pendingCandidates.Clear();
                 _encodedFrameCount = 0;
                 _h264ParamsReady = false;
@@ -181,27 +284,56 @@ namespace EmulatorDesktopApp.Services
                 _codecReadyLogged = false;
                 _loggedSps = false;
                 _loggedPps = false;
+                _loggedNonPrimaryVideoStream = false;
+                _unifiedH264Framer = null;
+                _videoRtpPacketsReceived = 0;
                 _dropDecodedUntilIdr = false;
                 _acceptNextDecodedFrame = false;
+                _sceneCutActivatedTicks = 0;
                 _skippedPreParamFrames = 0;
                 _acceptedIdrCount = 0;
+                _iceCandidateLogCount = 0;
+                _concealmentAtLastPresent = 0;
                 lock (_paramSetLock)
                 {
                     _cachedSpsNal = null;
                     _cachedPpsNal = null;
                 }
 
+                // Create (or reuse) the scene-cut watchdog timer — armed
+                // only when NotifySceneCut() is called, disarmed in ClosePeer().
+                _sceneCutWatchdog ??= new Timer(OnSceneCutWatchdog, null,
+                    Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+
+                // Reset A/B diagnostics for this session and start the periodic
+                // stats reporter (every 5 s, to both providers' log lines for
+                // side-by-side comparison).
+                _diagLogger.ResetForSession();
+                _diagLogger.Sink = msg => OnLog?.Invoke(msg);
+                _firstDecodedFrameTicks = 0;
+                _statsSessionStartTicks = Stopwatch.GetTimestamp();
+                _statsTimer?.Dispose();
+                _statsTimer = new Timer(_ => EmitAbStats(), null,
+                    dueTime: TimeSpan.FromSeconds(5),
+                    period: TimeSpan.FromSeconds(5));
+
+                // No STUN servers: this is local-network streaming and STUN
+                // requires internet round-trips that add 3–5 s of startup
+                // latency while waiting for STUN responses (or their timeouts).
+                // Host candidates are sufficient on a LAN.
                 var config = new RTCConfiguration
                 {
-                    iceServers = new List<RTCIceServer>
-                    {
-                        new() { urls = "stun:stun.l.google.com:19302" },
-                        new() { urls = "stun:stun1.l.google.com:19302" },
-                        new() { urls = "stun:stun2.l.google.com:19302" }
-                    }
+                    iceServers = new List<RTCIceServer>(),
+                    X_UseRtpFeedbackProfile = true
                 };
 
+                _peerConnection = new RTCPeerConnection(config);
+                SetupPeerConnectionEvents();
+
+                // FFmpegVideoEndPoint is required for correct H.264 payload-type
+                // negotiation (server uses dynamic PT e.g. 97).
                 _videoEndPoint = new FFmpegVideoEndPoint();
+                _videoEndPoint.RestrictFormats(IsH264Format);
                 _videoEndPoint.OnVideoSinkDecodedSampleFaster += HandleDecodedVideoFrame;
 
                 var sinkFormats = FilterH264Formats(_videoEndPoint.GetVideoSinkFormats());
@@ -213,9 +345,6 @@ namespace EmulatorDesktopApp.Services
 
                 OnLog?.Invoke($"[WebRTC] Decoder formats: {string.Join(", ", sinkFormats.Select(f => $"{f.FormatName} PT={f.FormatID}"))}");
 
-                _peerConnection = new RTCPeerConnection(config);
-                SetupPeerConnectionEvents();
-
                 var videoTrack = new MediaStreamTrack(sinkFormats, MediaStreamStatusEnum.RecvOnly);
                 _peerConnection.addTrack(videoTrack);
 
@@ -223,10 +352,13 @@ namespace EmulatorDesktopApp.Services
                 {
                     if (formats == null || formats.Count == 0)
                         return;
-                    ApplyDecoderFormat(PickH264Format(formats), "negotiated");
+                    var picked = PickH264Format(formats);
+                    ApplyDecoderFormat(picked, "negotiated");
+                    OnLog?.Invoke($"[WebRTC] Negotiated H.264 PT={picked.FormatID}");
                 };
 
-                OnLog?.Invoke("[WebRTC] Peer ready — using SIPSorcery RTP depacketization + FFmpeg decode");
+                OnLog?.Invoke("[WebRTC] Peer ready — SIPSorcery depacketization + FFmpeg decode");
+
                 OnStreamStatusChanged?.Invoke(StreamStatus.Initialized);
                 return true;
             }
@@ -238,10 +370,53 @@ namespace EmulatorDesktopApp.Services
             }
         }
 
+        /// <summary>Send a control event over the WebRTC DataChannel when open.</summary>
+        public bool TrySendControlViaDataChannel(object controlEvent)
+        {
+            if (_controlChannel?.readyState != RTCDataChannelState.open)
+                return false;
+
+            try
+            {
+                var json = JsonSerializer.Serialize(new { @event = controlEvent });
+                _controlChannel.send(json);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                OnLog?.Invoke($"[WebRTC] DataChannel send failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void WireControlDataChannel(RTCDataChannel channel)
+        {
+            if (!string.Equals(channel.label, "control", StringComparison.Ordinal))
+                return;
+
+            _controlChannel = channel;
+            channel.onopen += () => OnLog?.Invoke("[WebRTC] Control DataChannel OPEN");
+            channel.onclose += () =>
+            {
+                OnLog?.Invoke("[WebRTC] Control DataChannel CLOSED");
+                if (ReferenceEquals(_controlChannel, channel))
+                    _controlChannel = null;
+            };
+        }
+
+        private int _concealmentAtLastPresent;
+
         private void HandleDecodedVideoFrame(RawImage rawImage)
         {
             if (rawImage == null || rawImage.Width <= 0 || rawImage.Height <= 0)
                 return;
+
+            var conceal = _diagLogger.ConcealmentFrames;
+            if (conceal > _concealmentAtLastPresent)
+            {
+                _concealmentAtLastPresent = conceal;
+                return;
+            }
 
             if (_dropDecodedUntilIdr)
             {
@@ -251,8 +426,76 @@ namespace EmulatorDesktopApp.Services
                 _dropDecodedUntilIdr = false;
             }
 
-            Interlocked.Increment(ref _decodePublished);
+            var n = Interlocked.Increment(ref _decodePublished);
+
+            // One-shot: record the tick at which the first decoded frame arrived.
+            if (n == 1 && _statsSessionStartTicks > 0)
+            {
+                var ticks = Stopwatch.GetTimestamp();
+                if (Interlocked.CompareExchange(ref _firstDecodedFrameTicks, ticks, 0) == 0)
+                {
+                    var firstEncodedMs = _firstFrameTicks > 0
+                        ? (int)((_firstFrameTicks - _statsSessionStartTicks) / (double)Stopwatch.Frequency * 1000)
+                        : -1;
+                    var firstDecodedMs = (int)((ticks - _statsSessionStartTicks) / (double)Stopwatch.Frequency * 1000);
+                    OnLog?.Invoke($"[WebRTC] First decoded frame — " +
+                        $"firstEncodedMs={firstEncodedMs} firstDecodedMs={firstDecodedMs} " +
+                        $"resolution={rawImage.Width}x{rawImage.Height}");
+                }
+            }
+
             OnDecodedRawFrame?.Invoke(rawImage);
+        }
+
+        /// <summary>
+        /// Emits a single-line A/B comparison stats snapshot to <see cref="OnLog"/>.
+        /// Fired by the stats timer every 5 s and once at session close.
+        /// Parse with: grep "\[AB_STATS\]" server.log | column -t
+        /// </summary>
+        private void EmitAbStats()
+        {
+            try
+            {
+                var now = Stopwatch.GetTimestamp();
+                var elapsedSec = _statsSessionStartTicks > 0
+                    ? (now - _statsSessionStartTicks) / (double)Stopwatch.Frequency
+                    : 0;
+
+                var encoded  = _encodedFrameCount;
+                var decoded  = _decodePublished;
+                // Measure FPS from the first decoded frame onwards so the
+                // ~7 s startup window (no video) does not drag the number down.
+                var streamingSec = _firstDecodedFrameTicks > 0
+                    ? (now - _firstDecodedFrameTicks) / (double)Stopwatch.Frequency
+                    : 0;
+                var decodedFps = streamingSec > 1 ? Math.Round(decoded / streamingSec, 1) : 0.0;
+
+                var firstEncodedMs = _firstFrameTicks > 0 && _statsSessionStartTicks > 0
+                    ? (int)((_firstFrameTicks - _statsSessionStartTicks) / (double)Stopwatch.Frequency * 1000)
+                    : -1;
+                var firstDecodedMs = _firstDecodedFrameTicks > 0 && _statsSessionStartTicks > 0
+                    ? (int)((_firstDecodedFrameTicks - _statsSessionStartTicks) / (double)Stopwatch.Frequency * 1000)
+                    : -1;
+
+                var proc = Process.GetCurrentProcess();
+                proc.Refresh();
+                var memMB = proc.WorkingSet64 / 1024 / 1024;
+
+                OnLog?.Invoke(
+                    $"[AB_STATS] elapsed={elapsedSec:F1}s " +
+                    $"encoded={encoded} decoded={decoded} " +
+                    $"decodedFps={decodedFps:F1} " +
+                    $"acceptedIdr={_acceptedIdrCount} " +
+                    $"skippedPreGate={_skippedPreParamFrames} " +
+                    $"concealmentFrames={_diagLogger.ConcealmentFrames} " +
+                    $"ffmpegErrors={_diagLogger.FfmpegErrors} " +
+                    $"ffmpegWarnings={_diagLogger.FfmpegWarnings} " +
+                    $"videoRtp={_videoRtpPacketsReceived} " +
+                    $"firstEncodedMs={firstEncodedMs} " +
+                    $"firstDecodedMs={firstDecodedMs} " +
+                    $"memMB={memMB}");
+            }
+            catch { /* stats must never crash the app */ }
         }
 
         private void SetupPeerConnectionEvents()
@@ -265,7 +508,10 @@ namespace EmulatorDesktopApp.Services
                 if (candidate == null || string.IsNullOrEmpty(candidate.candidate))
                     return;
 
-                OnLog?.Invoke($"[WebRTC] Local ICE candidate: {candidate.candidate[..Math.Min(50, candidate.candidate.Length)]}...");
+                if (Interlocked.Increment(ref _iceCandidateLogCount) <= 2)
+                {
+                    OnLog?.Invoke($"[WebRTC] Local ICE candidate: {candidate.candidate[..Math.Min(50, candidate.candidate.Length)]}...");
+                }
                 var candidateJson = JsonSerializer.Serialize(new
                 {
                     candidate = candidate.candidate,
@@ -303,20 +549,155 @@ namespace EmulatorDesktopApp.Services
                     OnStreamStatusChanged?.Invoke(StreamStatus.Stopped);
             };
 
-            // SIPSorcery reconstructs full encoded frames from RTP (RFC 6184) — no custom FU-A assembly.
-            // Direct path (no jitter buffer): every received access unit is
-            // immediately admitted through the strict H.264 gate and, if
-            // accepted, handed to FFmpeg on the SIPSorcery network thread.
-            // Stability-first contract: synchronous, single-thread processing
-            // eliminates the buffer-vs-decoder teardown races and the
-            // MaxAge-induced silent drops we saw with the jitter buffer.
-            _peerConnection.OnVideoFrameReceived += (IPEndPoint remoteEndPoint, uint timestamp, byte[] payload, VideoFormat format) =>
+            _peerConnection.ondatachannel += dcEvt =>
             {
-                if (payload == null || payload.Length == 0)
-                    return;
+                if (dcEvt != null)
+                    WireControlDataChannel(dcEvt);
+            };
 
-                if (!IsH264Format(format))
-                    return;
+            // ── RTP delivery: direct path (jitter buffer intentionally disabled) ──
+            //
+            // SIPSorcery's RTCPeerConnection exposes two paths for received video:
+            //
+            //   A) OnVideoFrameReceived (used here):
+            //      RTP → SIPSorcery FU-A reassembly → full encoded access unit →
+            //      our CanFeedPayload gate → FFmpeg decode.
+            //      Delivers every reassembled AU synchronously on the network thread.
+            //      No jitter buffer depth, no MaxAge drops, zero added latency.
+            //
+            //   B) Automatic media endpoint pipe (would use the JB):
+            //      RTP → SIPSorcery jitter buffer (50–200 ms depth) → FU-A reassembly →
+            //      FFmpeg video endpoint → decoded frame.
+            //      Reorders out-of-sequence UDP packets before decoding.
+            //
+            // WHY WE USE PATH A (AND NOT B) FOR THIS SYSTEM
+            // ──────────────────────────────────────────────
+            // • This is a local-network or loopback stream. UDP packet reordering
+            //   probability over LAN/loopback is effectively zero; a jitter buffer
+            //   adds 50–200 ms latency without fixing anything.
+            //
+            // • The "concealing N DC, AC, MV errors" log messages that motivated
+            //   the jitter buffer request come from the *encoder*, not the network:
+            //   they appear when FFmpeg or the capture pipeline emit partial NAL units.
+            //   AnnexBIdrGate gates P-frames until a valid SPS+PPS+IDR sequence.
+            //
+            // • The CanFeedPayload / ExpandPayloadForDecoder gate (Path A) provides
+            //   the same correctness guarantee as a JB: no P-frame reaches FFmpeg
+            //   before a valid SPS+PPS+IDR sequence, eliminating decoder state
+            //   corruption regardless of network order.
+            //
+            // HOW TO ENABLE PATH B (JB) FOR WAN DEPLOYMENT
+            // ─────────────────────────────────────────────
+            // Remove the OnVideoFrameReceived subscription below, remove the manual
+            // _videoEndPoint.GotVideoFrame() call, and let SIPSorcery wire the
+            // media endpoint automatically (addTrack sets up the pipe).  Configure:
+            //
+            //   // (on the RTCSession inside the peer connection)
+            //   _peerConnection.VideoRtpChannel.UseRtpJitterBuffer = true;
+            //
+            // Then handle "no frame!" FFmpeg warnings by adding a SPS+PPS injector
+            // in the FFmpegVideoEndPoint.
+            //
+            // Per-stream SIPSorcery depacketizers can split STAP-A (stream 0) from
+            // IDR FU-A chains (stream 1) on the first connect when a local RecvOnly
+            // track is added before the remote offer lands.  Reassemble ALL video
+            // RTP through one H.264 framer so every access unit is delivered.
+            _peerConnection.OnRtpPacketReceivedByIndex += HandleIncomingRtpPacket;
+        }
+
+        private void HandleIncomingRtpPacket(
+            int streamIndex,
+            IPEndPoint remoteEndPoint,
+            SDPMediaTypesEnum mediaType,
+            RTPPacket rtpPacket)
+        {
+            if (mediaType != SDPMediaTypesEnum.video || rtpPacket?.Header == null)
+                return;
+
+            var pt = rtpPacket.Header.PayloadType;
+            if (_activeVideoFormat.HasValue && pt != _activeVideoFormat.Value.FormatID)
+                return;
+
+            var rtpCount = Interlocked.Increment(ref _videoRtpPacketsReceived);
+            if (rtpCount == 1 || rtpCount == 50 || rtpCount % 300 == 0)
+            {
+                OnLog?.Invoke(
+                    $"[WebRTC] Video RTP #{rtpCount} stream={streamIndex} pt={pt} " +
+                    $"seq={rtpPacket.Header.SequenceNumber} marker={rtpPacket.Header.MarkerBit}");
+            }
+
+            _unifiedH264Framer ??= new RtpVideoFramer(VideoCodecsEnum.H264, 1048576);
+
+            byte[]? frame;
+            try
+            {
+                frame = _unifiedH264Framer.GotRtpPacket(rtpPacket);
+            }
+            catch (Exception ex)
+            {
+                if (rtpCount <= 5 || rtpCount % 300 == 0)
+                    OnLog?.Invoke($"[WebRTC] RTP depacketize error: {ex.Message}");
+                return;
+            }
+
+            if (frame == null || frame.Length == 0)
+                return;
+
+            var format = _activeVideoFormat ?? new VideoFormat(VideoCodecsEnum.H264, pt);
+            HandleIncomingVideoFrame(streamIndex, remoteEndPoint, rtpPacket.Header.Timestamp, frame, format);
+        }
+
+        private void HandleIncomingVideoFrame(
+            int streamIndex,
+            IPEndPoint remoteEndPoint,
+            uint timestamp,
+            byte[] payload,
+            VideoFormat format)
+        {
+            if (payload == null || payload.Length == 0)
+                return;
+
+            if (!IsH264Format(format))
+                return;
+
+            if (streamIndex != 0 && !_loggedNonPrimaryVideoStream)
+            {
+                _loggedNonPrimaryVideoStream = true;
+                OnLog?.Invoke(
+                    $"[WebRTC] Video on stream index {streamIndex} " +
+                    $"(OnVideoFrameReceived only forwards index 0 — handling all indices)");
+            }
+
+            var n = Interlocked.Increment(ref _encodedFrameCount);
+            if (n == 1)
+            {
+                CancelMediaWatch();
+                _firstFrameTicks = Stopwatch.GetTimestamp();
+                OnLog?.Invoke(
+                    $"[WebRTC] First encoded frame from unified RTP framer " +
+                    $"(stream={streamIndex}, {payload.Length} bytes)");
+            }
+            else if (n == 5 || n == 30 || n == 60 || n == 120 || n % 300 == 0)
+            {
+                OnLog?.Invoke(
+                    $"[WebRTC] Encoded #{n} stream={streamIndex} bytes={payload.Length} " +
+                    $"decoded={_decodePublished} acceptedIdr={_acceptedIdrCount} " +
+                    $"droppedPreGate={_skippedPreParamFrames} sps={_h264ParamsReady} " +
+                    $"idr={_idrSinceReset} codecReady={CodecReady}");
+            }
+
+            LogPayloadShape(payload, n);
+            LogNalDiagnostics(payload, n);
+
+            UpdateParamSetFlags(payload);
+
+            foreach (var feed in ExpandPayloadForDecoder(payload))
+            {
+                if (!CanFeedPayload(feed))
+                {
+                    Interlocked.Increment(ref _skippedPreParamFrames);
+                    continue;
+                }
 
                 var endpoint = _videoEndPoint;
                 if (endpoint == null)
@@ -325,53 +706,38 @@ namespace EmulatorDesktopApp.Services
                 if (_activeVideoFormat == null || _activeVideoFormat.Value.FormatID != format.FormatID)
                     ApplyDecoderFormat(format, "frame");
 
-                var n = Interlocked.Increment(ref _encodedFrameCount);
-                if (n == 1)
+                try
                 {
-                    CancelMediaWatch();
-                    _firstFrameTicks = Stopwatch.GetTimestamp();
-                    OnLog?.Invoke($"[WebRTC] First encoded frame from SIPSorcery depacketizer ({payload.Length} bytes)");
+                    endpoint.GotVideoFrame(remoteEndPoint, timestamp, feed, format);
                 }
-                else if (n == 5 || n == 30 || n == 60 || n == 120 || n % 300 == 0)
+                catch (Exception ex)
                 {
-                    OnLog?.Invoke(
-                        $"[WebRTC] Encoded #{n} bytes={payload.Length} decoded={_decodePublished} " +
-                        $"acceptedIdr={_acceptedIdrCount} droppedPreGate={_skippedPreParamFrames} " +
-                        $"sps={_h264ParamsReady} idr={_idrSinceReset} codecReady={CodecReady}");
+                    if (n <= 5 || n % 60 == 0)
+                        OnLog?.Invoke($"[WebRTC] GotVideoFrame error: {ex.Message}");
                 }
+            }
+        }
 
-                LogPayloadShape(payload, n);
+        private void LogNalDiagnostics(byte[] payload, int frameNumber)
+        {
+            if (payload == null || payload.Length == 0) return;
 
-                // 1) Cache any SPS/PPS in this payload BEFORE we build the
-                //    decoder access unit, so the strict gate sees fresh
-                //    _h264ParamsReady on this very payload.
-                UpdateParamSetFlags(payload);
+            bool sample = frameNumber <= 20 || frameNumber % 120 == 0;
+            if (!sample) return;
 
-                // 2) Reassemble a single, standards-ordered Annex-B access
-                //    unit. Returns 0 feeds for parameter-sets-only payloads
-                //    (already cached), else 1 feed with SPS+PPS prepended in
-                //    front of every IDR for FFmpeg's safety.
-                foreach (var feed in ExpandPayloadForDecoder(payload))
-                {
-                    if (!CanFeedPayload(feed))
-                    {
-                        // Strict-gate spec: any pre-codecReady payload is
-                        // dropped silently. The heartbeat counter ticks.
-                        Interlocked.Increment(ref _skippedPreParamFrames);
-                        continue;
-                    }
+            var types = new List<int>();
+            foreach (var nal in ExtractAllNals(payload))
+            {
+                if (nal.Length == 0) continue;
+                types.Add(nal[0] & 0x1f);
+            }
 
-                    try
-                    {
-                        endpoint.GotVideoFrame(remoteEndPoint, timestamp, feed, format);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (n <= 5 || n % 60 == 0)
-                            OnLog?.Invoke($"[WebRTC] GotVideoFrame error: {ex.Message}");
-                    }
-                }
-            };
+            AnalyzeH264Payload(payload, out var hasSps, out var hasPps, out var hasIdr, out var hasP);
+            OnLog?.Invoke(
+                $"[H264-RX] frame=#{frameNumber} bytes={payload.Length} " +
+                $"nals=[{string.Join(",", types)}] " +
+                $"sps={hasSps} pps={hasPps} idr={hasIdr} p={hasP} " +
+                $"gateReady={CodecReady} acceptedIdr={_acceptedIdrCount}");
         }
 
         private void LogPayloadShape(byte[] payload, int frameNumber)
@@ -859,17 +1225,24 @@ namespace EmulatorDesktopApp.Services
 
         public async Task HandleOfferAsync(string sdpOffer)
         {
-            if (_peerConnection == null)
-            {
-                if (!await InitializePeerAsync(_currentSessionId ?? "default"))
-                {
-                    OnError?.Invoke("[WebRTC] Failed to initialize peer for offer");
-                    return;
-                }
-            }
-
+            await _offerNegotiationLock.WaitAsync();
             try
             {
+                if (_peerConnection == null)
+                {
+                    if (!await InitializePeerAsync(_currentSessionId ?? "default"))
+                    {
+                        OnError?.Invoke("[WebRTC] Failed to initialize peer for offer");
+                        return;
+                    }
+                }
+
+                if (_hasRemoteDescription)
+                {
+                    OnLog?.Invoke("[WebRTC] Offer already applied — ignoring duplicate");
+                    return;
+                }
+
                 SetSignalingRelay(true);
                 OnLog?.Invoke("[WebRTC] Processing SDP offer...");
                 var offer = new RTCSessionDescriptionInit
@@ -881,9 +1254,12 @@ namespace EmulatorDesktopApp.Services
                 var result = _peerConnection!.setRemoteDescription(offer);
                 if (result != SetDescriptionResultEnum.OK)
                 {
-                    var hint = result == SetDescriptionResultEnum.VideoIncompatible
-                        ? " Server SDP must offer H.264."
-                        : string.Empty;
+                    var hint = result switch
+                    {
+                        SetDescriptionResultEnum.VideoIncompatible => " Server SDP must offer H.264.",
+                        SetDescriptionResultEnum.NoMatchingMediaType => " Local recv track missing or incompatible with offer.",
+                        _ => string.Empty
+                    };
                     OnError?.Invoke($"[WebRTC] setRemoteDescription failed: {result}.{hint}");
                     return;
                 }
@@ -909,6 +1285,10 @@ namespace EmulatorDesktopApp.Services
             {
                 OnError?.Invoke($"[WebRTC] Failed to handle offer: {ex.Message}");
                 OnStreamStatusChanged?.Invoke(StreamStatus.Error);
+            }
+            finally
+            {
+                _offerNegotiationLock.Release();
             }
         }
 
@@ -1081,11 +1461,29 @@ namespace EmulatorDesktopApp.Services
         /// </summary>
         public void NotifySceneCut()
         {
-            _dropDecodedUntilIdr = true;
-            _acceptNextDecodedFrame = false;
+            if (_acceptedIdrCount == 0 && _decodePublished == 0)
+                return;
+
+            // Flush the render slot only. Do not gate FFmpeg decode here — the
+            // scene_cut WebSocket hint can arrive after the matching IDR RTP and
+            // would drop the keyframe, freezing the mirror until reconnect.
             try { OnSceneCut?.Invoke(); }
             catch { /* render-side flush must never fault the WebRTC path */ }
-            OnLog?.Invoke("[WebRTC] Scene cut hint — render slot flushed (gate, decoder, peer all kept intact)");
+            OnLog?.Invoke("[WebRTC] Scene cut hint — render slot flushed");
+        }
+
+        private void OnSceneCutWatchdog(object? _)
+        {
+            if (!_dropDecodedUntilIdr) return;
+
+            var staleSec = (Stopwatch.GetTimestamp() - _sceneCutActivatedTicks)
+                         / (double)Stopwatch.Frequency;
+            if (staleSec < SceneCutWatchdogSec) return;
+
+            _dropDecodedUntilIdr = false;
+            _acceptNextDecodedFrame = false;
+            OnLog?.Invoke(
+                $"[WebRTC] Scene-cut watchdog: reopening decode after {staleSec:F1}s without IDR");
         }
 
         public void StopStream()
@@ -1111,6 +1509,15 @@ namespace EmulatorDesktopApp.Services
         {
             SetSignalingRelay(false);
 
+            // Emit a final A/B stats snapshot before teardown so there is always
+            // a complete record even if the session ends mid-timer-interval.
+            EmitAbStats();
+            _statsTimer?.Dispose();
+            _statsTimer = null;
+            _diagLogger.Sink = null;
+            _firstDecodedFrameTicks = 0;
+            _statsSessionStartTicks = 0;
+
             if (_videoEndPoint != null)
             {
                 try
@@ -1121,6 +1528,8 @@ namespace EmulatorDesktopApp.Services
                 catch { }
                 _videoEndPoint = null;
             }
+
+            _controlChannel = null;
 
             if (_peerConnection != null)
             {
@@ -1136,13 +1545,22 @@ namespace EmulatorDesktopApp.Services
             }
 
             CancelMediaWatch();
+
+            // Disarm the scene-cut watchdog so it cannot fire during teardown
+            // and re-open the gate after _dropDecodedUntilIdr is cleared below.
+            _sceneCutWatchdog?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+
             _h264ParamsReady = false;
             _idrSinceReset = false;
             _codecReadyLogged = false;
             _loggedSps = false;
             _loggedPps = false;
+            _loggedNonPrimaryVideoStream = false;
+            _unifiedH264Framer = null;
+            _videoRtpPacketsReceived = 0;
             _dropDecodedUntilIdr = false;
             _acceptNextDecodedFrame = false;
+            _sceneCutActivatedTicks = 0;
             lock (_paramSetLock)
             {
                 _cachedSpsNal = null;
@@ -1168,18 +1586,14 @@ namespace EmulatorDesktopApp.Services
         public static string CreateStopStreamMessage(string sessionId) =>
             JsonSerializer.Serialize(new { type = "stop_stream", session_id = sessionId });
 
-        public static string CreateWebRTCAnswerMessage(string sessionId, string sdp) =>
-            JsonSerializer.Serialize(new { type = "webrtc_answer", session_id = sessionId, sdp });
-
-        public static string CreateIceCandidateMessage(string sessionId, string candidate) =>
-            JsonSerializer.Serialize(new { type = "ice_candidate", session_id = sessionId, candidate });
-
         public void Dispose()
         {
             if (_disposed)
                 return;
             _disposed = true;
             ClosePeer();
+            _sceneCutWatchdog?.Dispose();
+            _sceneCutWatchdog = null;
             GC.SuppressFinalize(this);
         }
     }

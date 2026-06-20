@@ -11,12 +11,22 @@ const { createLogger } = require('../../lib/logger');
 const logger = createLogger('PEER');
 
 /**
- * ICE server configuration
+ * ICE server configuration.
+ *
+ * For local-network streaming, STUN is unnecessary — host candidates resolve
+ * immediately.  Keeping Google STUN servers delays ICE gathering by 3–5 s
+ * while waiting for internet round-trips (or timeout).
+ *
+ * Set USE_STUN_SERVERS=true in the environment to re-enable STUN (e.g. for
+ * cross-NAT deployments).
  */
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' }
-];
+const ICE_SERVERS =
+  process.env.USE_STUN_SERVERS === 'true'
+    ? [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    : [];
 
 /** H.264 only — v2 capture/RTP path does not encode VP8. */
 const H264_CODEC = useH264({
@@ -205,7 +215,7 @@ class PeerConnectionManager {
       }
 
       if (sender.onReady) {
-        sender.onReady.subscribe(() => {
+        const sub = sender.onReady.subscribe(() => {
           const sendParams = this._readVideoSendParams(peerInfo);
           this._syncNegotiatedCodec(peerInfo, sendParams);
           logger.info('Video sender DTLS ready — RTP can be sent', {
@@ -219,10 +229,12 @@ class PeerConnectionManager {
             this._startPendingPipeline(sessionId);
           }
         });
+        if (typeof sub === 'function') peerInfo.disposables.push(sub);
+        else if (sub?.dispose) peerInfo.disposables.push(() => sub.dispose());
       }
 
       if (sender.dtlsTransport?.onStateChange) {
-        sender.dtlsTransport.onStateChange.subscribe((state) => {
+        const sub = sender.dtlsTransport.onStateChange.subscribe((state) => {
           logger.info('Sender DTLS state', { sessionId, state });
           if (state === 'connected') {
             this._notifyMediaReady(sessionId);
@@ -232,6 +244,8 @@ class PeerConnectionManager {
             }
           }
         });
+        if (typeof sub === 'function') peerInfo.disposables.push(sub);
+        else if (sub?.dispose) peerInfo.disposables.push(() => sub.dispose());
       }
 
       return true;
@@ -284,11 +298,17 @@ class PeerConnectionManager {
           packetsSent: 0,
           bytesSent: 0,
           framesSent: 0
-        }
+        },
+        disposables: []
+      };
+
+      const trackDisposable = (sub) => {
+        if (typeof sub === 'function') peerInfo.disposables.push(sub);
+        else if (sub?.dispose) peerInfo.disposables.push(() => sub.dispose());
       };
 
       // ICE candidate handler - send to client
-      pc.onIceCandidate.subscribe((candidate) => {
+      trackDisposable(pc.onIceCandidate.subscribe((candidate) => {
         if (candidate && peerInfo.session) {
           logger.debug('ICE candidate generated', { sessionId });
           peerInfo.session.send({
@@ -296,10 +316,10 @@ class PeerConnectionManager {
             data: { candidate: candidate.toJSON() }
           });
         }
-      });
+      }));
 
       // ICE connection state handler
-      pc.iceConnectionStateChange.subscribe(() => {
+      trackDisposable(pc.iceConnectionStateChange.subscribe(() => {
         peerInfo.iceConnectionState = pc.iceConnectionState;
         logger.info('ICE connection state changed', { 
           sessionId, 
@@ -320,10 +340,10 @@ class PeerConnectionManager {
           peerInfo.state = 'disconnected';
           logger.info('WebRTC peer disconnected', { sessionId });
         }
-      });
+      }));
 
       // Connection + DTLS handlers — start encoder as soon as the path is usable
-      pc.connectionStateChange.subscribe(() => {
+      trackDisposable(pc.connectionStateChange.subscribe(() => {
         logger.info('Connection state changed', {
           sessionId,
           state: pc.connectionState
@@ -333,7 +353,7 @@ class PeerConnectionManager {
           peerInfo.pendingPipelineStart = false;
           this._startPendingPipeline(sessionId);
         }
-      });
+      }));
 
       this._attachSenderReady(sessionId, peerInfo);
 
@@ -750,6 +770,11 @@ class PeerConnectionManager {
     if (!peerInfo) return { success: true };
 
     try {
+      for (const dispose of peerInfo.disposables ?? []) {
+        try { dispose(); } catch { /* ignore */ }
+      }
+      peerInfo.disposables = [];
+
       if (peerInfo.pc.connectionState !== 'closed') {
         peerInfo.pc.close();
       }

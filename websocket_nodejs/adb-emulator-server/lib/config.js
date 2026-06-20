@@ -54,7 +54,27 @@ const streamConfig = {
    * media playback). Beyond 12 Mbps the wire bandwidth becomes the bottleneck
    * on Wi-Fi.
    */
-  recordBitrate: parseIntEnv('STREAM_RECORD_BITRATE', 6_000_000),
+  recordBitrate: parseIntEnv('STREAM_RECORD_BITRATE', 8_000_000),
+
+  // ── Android-specific capture tuning ─────────────────────────────────────
+  // scrcpy MediaCodec: max_size limits the long edge; bitrate drives blockiness.
+  androidMaxSize:  parseIntEnv('ANDROID_MAX_SIZE', 1080),
+  androidWidth:    parseIntEnv('ANDROID_STREAM_WIDTH',   1080),
+  androidHeight:   parseIntEnv('ANDROID_STREAM_HEIGHT',  2400),
+  androidBitrate:  parseIntEnv('ANDROID_STREAM_BITRATE', 8_000_000),
+  androidFps:      parseIntEnv('ANDROID_STREAM_FPS', 30),
+
+  // ── iOS-specific capture tuning ─────────────────────────────────────────
+  // CoreSimulator capture is native-resolution (no max_size); width/height are
+  // informational only. fps + bitrate drive the VideoToolbox encoder.
+  iosFps:           parseIntEnv('IOS_STREAM_FPS', 30),
+  iosBitrate:       parseIntEnv('IOS_STREAM_BITRATE', 6_000_000),
+  iosKeyframeSec:   parseIntEnv('IOS_KEYFRAME_INTERVAL_SEC', 1),
+  // Helper + tool paths.
+  coresimHelperPath: process.env.CORESIM_HELPER_PATH ||
+    require('path').resolve(__dirname, '../stream/capture/ios/coresim-capture/coresim-capture'),
+  idbPath:          process.env.IDB_PATH || 'idb',
+  developerDir:     process.env.DEVELOPER_DIR || '',
 
   /**
    * `screenrecord --time-limit` value (seconds).

@@ -1,0 +1,19 @@
+{
+  "_comment": "Canonical geometry vectors shared by the JS server tests (node --test) and the C# client GeometryModel parity test. Both implementations MUST produce identical results within 1e-6.",
+  "rotationRoundTrip": [
+    { "deviceN": { "nx": 0.25, "ny": 0.75 }, "rotation": 0,   "displayN": { "nx": 0.25, "ny": 0.75 } },
+    { "deviceN": { "nx": 0.25, "ny": 0.75 }, "rotation": 90,  "displayN": { "nx": 0.25, "ny": 0.25 } },
+    { "deviceN": { "nx": 0.25, "ny": 0.75 }, "rotation": 180, "displayN": { "nx": 0.75, "ny": 0.25 } },
+    { "deviceN": { "nx": 0.25, "ny": 0.75 }, "rotation": 270, "displayN": { "nx": 0.75, "ny": 0.75 } },
+    { "deviceN": { "nx": 0.10, "ny": 0.20 }, "rotation": 90,  "displayN": { "nx": 0.80, "ny": 0.10 } }
+  ],
+  "contentRect": [
+    { "view": { "w": 400, "h": 800 }, "stream": { "w": 393, "h": 852 }, "rect": { "x": 15.492957746478855, "y": 0, "w": 369.0140845070423, "h": 800 } },
+    { "view": { "w": 800, "h": 400 }, "stream": { "w": 1280, "h": 720 }, "rect": { "x": 44.44444444444446, "y": 0, "w": 711.1111111111111, "h": 400 } }
+  ],
+  "devicePoints": [
+    { "deviceN": { "nx": 0.5, "ny": 0.5 }, "deviceLogical": { "w": 393, "h": 852 }, "points": { "x": 196.5, "y": 426 } },
+    { "deviceN": { "nx": 0.0, "ny": 0.0 }, "deviceLogical": { "w": 393, "h": 852 }, "points": { "x": 0, "y": 0 } },
+    { "deviceN": { "nx": 1.0, "ny": 1.0 }, "deviceLogical": { "w": 393, "h": 852 }, "points": { "x": 393, "y": 852 } }
+  ]
+}

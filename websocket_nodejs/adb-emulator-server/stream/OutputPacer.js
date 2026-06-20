@@ -75,15 +75,24 @@ class OutputPacer {
     this._lastSendAt = 0;
   }
 
-  /** Send immediately — no queue. */
+  /**
+   * Send immediately — no queue.
+   *
+   * SEMANTICS OF _enabled
+   * ──────────────────────
+   * _enabled = true  → forward frame AND allow idle-fill repeats on silence.
+   * _enabled = false → forward frame BUT suppress idle-fill repeats.
+   *
+   * Frames are ALWAYS forwarded regardless of _enabled.  The previous
+   * implementation dropped frames when disabled, which caused frame freezes
+   * whenever _startDecoderWarmup was re-entered during an active stream (e.g.
+   * a DTLS re-event calling _tryCompleteStartup with gate already open).
+   * Since deliverFrame() already guards on gate.open, the pacer is only
+   * submitted real frames that MUST reach the sender.
+   */
   submit(frame) {
     if (!frame) return;
     this._stats.submitted++;
-    if (!this._enabled) {
-      this._stats.blocked++;
-      this._stats.lastDropReason = 'pacer_disabled';
-      return;
-    }
     this._latest = frame;
     this._sendNow(frame);
   }
@@ -107,6 +116,8 @@ class OutputPacer {
       queueDepthPeak: 0,
       queueCap: 0,
       fps: this._fps,
+      // 'immediate' always — we never queue/hold frames.
+      // idleFill state is reflected by pacerEnabled in the heartbeat.
       mode: 'immediate'
     };
   }

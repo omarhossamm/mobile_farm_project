@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
@@ -13,7 +14,7 @@ namespace EmulatorDesktopApp.Streaming
 {
     /// <summary>
     /// Latest-frame-only render path: decode slot → worker convert &amp; upload →
-    /// coalesced UI bitmap swap.
+    /// coalesced, rate-limited UI bitmap swap.
     ///
     /// THREADING MODEL
     /// ───────────────
@@ -25,9 +26,12 @@ namespace EmulatorDesktopApp.Streaming
     ///   converts the decoded pixels straight into that bitmap's locked
     ///   framebuffer. No intermediate scratch BGRA buffer is allocated or
     ///   copied.
-    /// • UI thread receives one coalesced <see cref="Dispatcher.UIThread"/>
-    ///   post per produced frame. It performs a single reference assignment
-    ///   (<c>Image.Source = bitmap</c>) — no pixel work, no locking.
+    /// • UI thread receives at most <see cref="MaxRenderFps"/> coalesced
+    ///   <see cref="Dispatcher.UIThread"/> posts per second (default 30 FPS).
+    ///   Between posts a <see cref="Task.Delay"/> re-schedules the next pump
+    ///   without pinning the UI thread in a tight loop. It performs a single
+    ///   reference assignment (<c>Image.Source = bitmap</c>) — no pixel work,
+    ///   no locking.
     ///
     /// 4-BITMAP STRICT ROTATION
     /// ────────────────────────
@@ -39,10 +43,43 @@ namespace EmulatorDesktopApp.Streaming
     /// about to overwrite has definitely cycled out of the GPU pipeline.
     /// This makes the worker oblivious to UI bookkeeping and removes every
     /// shared lock between the worker and the UI thread.
+    ///
+    /// RENDER FPS CAP
+    /// ──────────────
+    /// When the FFmpeg decoder produces frames faster than the cap (e.g. the
+    /// server sends at 60 FPS but the display runs at 60 Hz with an Avalonia
+    /// compositor overhead of ~4 ms/frame), the dispatcher queue would fill up
+    /// causing input-event latency and visible jitter.  The cap:
+    ///   1. Checks wall-clock time in <see cref="RunUiPump"/>.
+    ///   2. If a newer frame exists but the minimum inter-present interval has
+    ///      not elapsed, schedules a <see cref="Task.Delay"/> on the thread
+    ///      pool that fires <see cref="RequestUiPresent"/> after the remaining
+    ///      time — coalescing with any frame the worker produces in the interim.
+        ///   At 60 FPS the UI dispatcher sees at most one post every ~16 ms,
+    ///      leaving the thread free for input events, animations, and chrome.
     /// </summary>
     public sealed class VideoRenderPipeline : IDisposable
     {
         private const int BitmapPoolSize = 4;
+
+        /// <summary>
+        /// Maximum UI frames-per-second. Reduce to 25 on lower-end hardware;
+        /// raise to 60 only if your display and compositor can sustain it
+        /// without introducing new dispatcher contention.
+        /// Override at runtime with the RENDER_TARGET_FPS environment variable.
+        /// </summary>
+        public static readonly int MaxRenderFps = ResolveMaxRenderFps();
+
+        private static readonly long MinRenderIntervalTicks =
+            Stopwatch.Frequency / Math.Max(1, MaxRenderFps);
+
+        private static int ResolveMaxRenderFps()
+        {
+            if (int.TryParse(System.Environment.GetEnvironmentVariable("RENDER_TARGET_FPS"),
+                out var v) && v > 0 && v <= 120)
+                return v;
+            return 60;
+        }
 
         private readonly LatestFrameSlot _slot = new();
         private readonly Action<string> _log;
@@ -67,6 +104,11 @@ namespace EmulatorDesktopApp.Streaming
         private int _uiPumpScheduled;
         private int _lastUiPresentedGeneration;
 
+        // Ticks of the last successful UI present — written only on the UI
+        // thread (inside RunUiPump), read only on the UI thread, so no
+        // Interlocked or volatile required.
+        private long _lastPresentTicks;
+
         private int _convertedCount;
         private int _presentedCount;
         private bool _disposed;
@@ -80,6 +122,9 @@ namespace EmulatorDesktopApp.Streaming
         /// </summary>
         public void OnSceneCut()
         {
+            if (_target?.IsShuttingDown == true)
+                return;
+
             _slot.Clear();
             _pendingFrontBitmap = null;
             Interlocked.Increment(ref _latestGenForUi);
@@ -111,6 +156,7 @@ namespace EmulatorDesktopApp.Streaming
             _convertedCount = 0;
             _presentedCount = 0;
             _lastUiPresentedGeneration = 0;
+            _lastPresentTicks = 0;
             Interlocked.Exchange(ref _latestGenForUi, 0);
             Interlocked.Exchange(ref _uiPumpScheduled, 0);
 
@@ -120,18 +166,32 @@ namespace EmulatorDesktopApp.Streaming
 
         public void Stop()
         {
-            StopWorker();
+            StopAsync().GetAwaiter().GetResult();
+        }
+
+        public async Task StopAsync()
+        {
+            await StopWorkerAsync();
             _slot.Clear();
+            Interlocked.Exchange(ref _uiPumpScheduled, 0);
         }
 
         public void ClearBitmap()
         {
-            for (int i = 0; i < _bitmaps.Length; i++)
-                _bitmaps[i] = null;
+            ReleaseBitmapPool();
             _pendingFrontBitmap = null;
             _writeIndex = 0;
             _bitmapWidth = 0;
             _bitmapHeight = 0;
+        }
+
+        private void ReleaseBitmapPool()
+        {
+            for (int i = 0; i < _bitmaps.Length; i++)
+            {
+                _bitmaps[i]?.Dispose();
+                _bitmaps[i] = null;
+            }
         }
 
         private void EnsureBitmapPool(int width, int height)
@@ -141,6 +201,8 @@ namespace EmulatorDesktopApp.Streaming
                 if (_bitmaps[i] == null) { needsAlloc = true; break; }
 
             if (!needsAlloc) return;
+
+            ReleaseBitmapPool();
 
             for (int i = 0; i < _bitmaps.Length; i++)
             {
@@ -173,16 +235,29 @@ namespace EmulatorDesktopApp.Streaming
 
         private void StopWorker()
         {
-            if (_workerCts == null) return;
+            StopWorkerAsync().GetAwaiter().GetResult();
+        }
+
+        private async Task StopWorkerAsync()
+        {
+            if (_workerCts == null)
+                return;
 
             _frameSignal.Set();
             _workerCts.Cancel();
-            try { _workerTask?.Wait(TimeSpan.FromSeconds(2)); }
-            catch { /* ignore on shutdown */ }
 
-            _workerCts.Dispose();
+            var task = _workerTask;
+            var cts = _workerCts;
             _workerCts = null;
             _workerTask = null;
+
+            if (task != null)
+            {
+                try { await task.WaitAsync(TimeSpan.FromSeconds(2)); }
+                catch { /* ignore on shutdown */ }
+            }
+
+            cts.Dispose();
         }
 
         private void WorkerLoop(CancellationToken cancel)
@@ -279,21 +354,59 @@ namespace EmulatorDesktopApp.Streaming
 
         private void RequestUiPresent()
         {
+            // CAS guarantees at most one outstanding post to the dispatcher.
+            // Both the worker thread and the Task.Delay continuation call this;
+            // whichever gets CAS first owns the post, the other is a no-op.
             if (Interlocked.CompareExchange(ref _uiPumpScheduled, 1, 0) != 0)
                 return;
 
-            Dispatcher.UIThread.Post(RunUiPump, DispatcherPriority.Render);
+            Dispatcher.UIThread.Post(RunUiPump, DispatcherPriority.Send);
         }
 
+        /// <summary>
+        /// Runs on the Avalonia UI thread.  Presents the newest frame and
+        /// re-schedules at most once per <see cref="MinRenderIntervalTicks"/>
+        /// to keep the dispatcher free for input events.
+        /// </summary>
         private void RunUiPump()
         {
             Interlocked.Exchange(ref _uiPumpScheduled, 0);
-            if (_disposed || _target == null) return;
+            if (_disposed || _target == null || _target.IsShuttingDown)
+                return;
 
             int gen = Interlocked.CompareExchange(ref _latestGenForUi, 0, 0);
             if (gen > _lastUiPresentedGeneration)
-                PresentLatest(gen);
+            {
+                // ── Render-rate cap ──────────────────────────────────────
+                // Measure wall-clock time since the last present.  If we are
+                // being called faster than MaxRenderFps, defer a re-post
+                // instead of presenting immediately — this prevents the
+                // dispatcher queue from filling at 60+ fps.
+                var now = Stopwatch.GetTimestamp();
+                var elapsed = now - _lastPresentTicks;
 
+                if (_lastPresentTicks > 0 && elapsed < MinRenderIntervalTicks)
+                {
+                    // Too soon.  Schedule a deferred re-post via the thread
+                    // pool — the delay keeps the UI thread idle (no spinning).
+                    // Any frame the worker produces in the meantime is picked
+                    // up by the next call to RunUiPump.
+                    var remainingMs = (int)Math.Max(
+                        1,
+                        (MinRenderIntervalTicks - elapsed) * 1000 / Stopwatch.Frequency);
+
+                    _ = Task.Delay(remainingMs).ContinueWith(
+                        _ => RequestUiPresent(),
+                        TaskScheduler.Default);
+                    return;
+                }
+
+                PresentLatest(gen);
+            }
+
+            // If the worker produced more frames while we were presenting,
+            // reschedule immediately (we already spent the inter-present
+            // interval on the present above, so no additional delay needed).
             if (Interlocked.CompareExchange(ref _latestGenForUi, 0, 0) > gen)
                 RequestUiPresent();
         }
@@ -301,6 +414,7 @@ namespace EmulatorDesktopApp.Streaming
         private void PresentLatest(int generation)
         {
             if (generation <= _lastUiPresentedGeneration) return;
+            if (_target?.IsShuttingDown == true) return;
 
             // Volatile read of the bitmap the worker prepared. The worker
             // always overwrites this field on its next tick, so we don't
@@ -314,10 +428,11 @@ namespace EmulatorDesktopApp.Streaming
                 _target.NotifyFrameRendered();
 
                 _lastUiPresentedGeneration = generation;
+                _lastPresentTicks = Stopwatch.GetTimestamp();
 
                 int presented = Interlocked.Increment(ref _presentedCount);
                 if (presented == 1)
-                    _log($"[RENDER] First present {_bitmapWidth}x{_bitmapHeight}");
+                    _log($"[RENDER] First present {_bitmapWidth}x{_bitmapHeight} cap={MaxRenderFps}fps");
                 else if (presented % 120 == 0)
                     _log($"[RENDER] Presented #{presented} (slot skips: {SkippedBeforeRender})");
             }
@@ -334,7 +449,7 @@ namespace EmulatorDesktopApp.Streaming
             _disposed = true;
             Stop();
             _frameSignal.Dispose();
-            ClearBitmap();
+            ReleaseBitmapPool();
         }
     }
 }

@@ -24,7 +24,7 @@
                           FontSize="28"
                           FontWeight="Bold"
                           Foreground="#FFFFFF" />
-                <TextBlock Text="Connect to WebSocket server, create a session, then start stream (opens video window)"
+                <TextBlock Text="Connect, create a session, then start stream (Android emulator mirror)"
                           FontSize="14"
                           Foreground="#888888"
                           Margin="0,4,0,0" />
@@ -142,7 +142,7 @@
                     Padding="20">
                 <Grid RowDefinitions="Auto,Auto,12,Auto" ColumnDefinitions="*,Auto,Auto,Auto,Auto">
 
-                    <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="5"
+                    <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="4"
                               Text="Device"
                               FontSize="12"
                               FontWeight="SemiBold"
@@ -162,14 +162,27 @@
                              Margin="0,0,12,0">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DeviceOption">
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Ellipse Width="8"
-                                             Height="8"
-                                             VerticalAlignment="Center">
+                                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                    <Ellipse Width="8" Height="8" VerticalAlignment="Center">
                                         <Ellipse.Fill>
                                             <SolidColorBrush Color="{Binding StatusColor}" />
                                         </Ellipse.Fill>
                                     </Ellipse>
+                                    <Border CornerRadius="4"
+                                            Padding="5,2"
+                                            VerticalAlignment="Center">
+                                        <Border.Background>
+                                            <SolidColorBrush Color="{Binding PlatformColor}" Opacity="0.18" />
+                                        </Border.Background>
+                                        <TextBlock Text="{Binding PlatformLabel}"
+                                                   FontSize="10"
+                                                   FontWeight="SemiBold"
+                                                   VerticalAlignment="Center">
+                                            <TextBlock.Foreground>
+                                                <SolidColorBrush Color="{Binding PlatformColor}" />
+                                            </TextBlock.Foreground>
+                                        </TextBlock>
+                                    </Border>
                                     <TextBlock Text="{Binding DisplayName}"
                                                VerticalAlignment="Center" />
                                 </StackPanel>
@@ -224,6 +237,7 @@
                            CornerRadius="8"
                            Background="#DC3545"
                            Foreground="#FFFFFF"
+                           Margin="0,0,0,0"
                            Cursor="Hand" />
 
                     <TextBlock Grid.Row="3" Grid.Column="0"
@@ -255,7 +269,7 @@
                         </StackPanel>
                     </Border>
 
-                    <Button Grid.Row="3" Grid.Column="3"
+                    <Button Grid.Row="3" Grid.Column="2"
                            Content="Start Stream"
                            Command="{Binding StartStreamCommand}"
                            FontSize="13"
@@ -267,7 +281,7 @@
                            Margin="0,0,8,0"
                            Cursor="Hand" />
 
-                    <Button Grid.Row="3" Grid.Column="4"
+                    <Button Grid.Row="3" Grid.Column="3"
                            Content="Stop Stream"
                            Command="{Binding StopStreamCommand}"
                            FontSize="13"

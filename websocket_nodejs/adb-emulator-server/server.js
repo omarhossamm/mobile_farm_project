@@ -1,10 +1,13 @@
 /**
- * Android Emulator Control Server
- * WebSocket server for controlling Android emulators via ADB
+ * Device farm control server — Android emulators over WebSocket/WebRTC.
  */
 
 const WebSocket = require('ws');
 const http = require('http');
+const fs = require('fs').promises;
+const path = require('path');
+const os = require('os');
+const { spawn: _spawn } = require('child_process');
 const adb = require('./adb');
 const emulator = require('./emulator');
 const { emulatorManager } = require('./emulatorManager');
@@ -13,12 +16,61 @@ const { webrtcSignaling } = require('./webrtcSignaling');
 const { controlRouter } = require('./control/ControlRouter');
 const { streamConfig } = require('./lib/config');
 const { streamManager } = require('./stream');
+const { killOrphanedScrcpyOnDevice } = require('./stream/capture/android/ScrcpyCaptureStream');
 const { buildDeviceCatalog, resolveAvdNameForDevice } = require('./devicesCatalog');
+const { platformHost } = require('./platform');
+const simctl = require('./lib/simctl');
+const { resolveDeviceGeometry } = require('./config/iosDeviceSizes');
+
+/** A simulator UDID is a canonical UUID (8-4-4-4-12 hex). */
+const IOS_UDID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+function isIosUdid(id) {
+  return typeof id === 'string' && IOS_UDID_RE.test(id);
+}
+
+/**
+ * Best-effort: kill any orphaned `screenrecord` process on the Android device
+ * before a new stream starts.  Two competing MediaCodec encoders share a single
+ * ADB transport, causing the new encoder to starve and produce the
+ * `stall_no_data` error seen by the client.
+ *
+ * Resolves as soon as the adb command exits or after a 1-second safety timeout
+ * so a slow or temporarily offline device never blocks the stream start path.
+ */
+function _killOrphanedScreenrecord(deviceId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = () => { if (!settled) { settled = true; resolve(); } };
+
+    const guard = setTimeout(settle, 1000);
+
+    const proc = _spawn(
+      streamConfig.adbPath || 'adb',
+      ['-s', deviceId, 'shell', 'pkill', '-KILL', 'screenrecord'],
+      { stdio: 'ignore' }
+    );
+    proc.on('close', () => { clearTimeout(guard); settle(); });
+    proc.on('error', () => { clearTimeout(guard); settle(); });
+  });
+}
+
+/**
+ * Best-effort cleanup before (re)starting Android capture.  Orphaned scrcpy or
+ * screenrecord processes keep `localabstract:scrcpy` / MediaCodec busy so the
+ * next session connects but never emits IDR frames (stall_no_data).
+ */
+async function _prepareAndroidCaptureRestart(deviceId) {
+  if (!deviceId || isIosUdid(deviceId)) return;
+  await _killOrphanedScreenrecord(deviceId);
+  await killOrphanedScrcpyOnDevice(deviceId, streamConfig.adbPath || 'adb');
+}
 
 // Configuration
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL, 10) || 30000;
+/** Consecutive missed WS pongs before terminating (background clients need leeway). */
+const WS_MAX_MISSED_PONGS = parseInt(process.env.WS_MAX_MISSED_PONGS, 10) || 3;
 const SESSION_CLEANUP_INTERVAL = parseInt(process.env.SESSION_CLEANUP_INTERVAL, 10) || 300000; // 5 minutes
 const KILL_EMULATOR_ON_DISCONNECT = process.env.KILL_EMULATOR_ON_DISCONNECT !== 'false';
 
@@ -43,11 +95,128 @@ const logger = {
 };
 
 /**
- * Stop stream and unbind device from a session without closing its WebSocket.
+ * Bind a WebSocket session to the platform control plane (ADB).
+ */
+function bindPlatformSession(session, deviceId, { ownsDevice = false } = {}) {
+  const targetClass = deviceId.startsWith('emulator-') ? 'emulator'
+    : deviceId.includes(':') ? 'physical'
+    : 'emulator';
+
+  const handle = {
+    ref: {
+      id: deviceId,
+      platform: 'android',
+      targetClass,
+      status: 'online',
+      displayName: deviceId
+    },
+    sessionId: session.id,
+    hostId: 'local',
+    leaseId: session.id,
+    ownedBySession: ownsDevice
+  };
+
+  session.deviceHandle = handle;
+  platformHost.bindSession(session.id, handle);
+}
+
+/**
+ * Bind a WebSocket session to an iOS simulator (control plane = idb HID).
+ * @param {object} session
+ * @param {object} device  simctl device { udid, name, deviceTypeIdentifier, runtime }
+ * @param {{ownsDevice?: boolean}} [opts]
+ */
+function bindIosSession(session, device, { ownsDevice = false } = {}) {
+  const { logical, scale } = resolveDeviceGeometry(device.deviceTypeIdentifier, null);
+  const handle = {
+    ref: {
+      id: device.udid,
+      platform: 'ios',
+      targetClass: 'simulator',
+      status: 'online',
+      displayName: device.name,
+      deviceTypeIdentifier: device.deviceTypeIdentifier,
+      metadata: {
+        kind: 'simulator',
+        deviceTypeIdentifier: device.deviceTypeIdentifier,
+        runtime: device.runtime,
+        logical_width: logical.w,
+        logical_height: logical.h,
+        backing_scale: scale
+      }
+    },
+    sessionId: session.id,
+    hostId: 'local',
+    leaseId: session.id,
+    ownedBySession: ownsDevice
+  };
+
+  session.deviceHandle = handle;
+  platformHost.bindSession(session.id, handle);
+}
+
+/**
+ * Create/bind an iOS simulator session: boot if needed, then bind the handle.
+ */
+async function createIosSession(session, udid, options, payload) {
+  const device = await simctl.getDevice(udid);
+  if (!device) {
+    session.sendError('session_created', `Simulator ${udid} not found (xcrun simctl).`, payload.requestId);
+    return;
+  }
+
+  let ownsDevice = false;
+  if (device.state !== 'Booted') {
+    session.send({
+      type: 'session_creating',
+      device: device.name,
+      message: 'Simulator is shut down. Booting on server...',
+      requestId: payload.requestId
+    });
+    const lifecycle = platformHost.registry.resolveLifecycle({ platform: 'ios', targetClass: 'simulator', id: udid, status: 'offline' });
+    const acquired = await lifecycle.acquire(
+      { platform: 'ios', targetClass: 'simulator', id: udid, status: 'offline' },
+      session.id,
+      options
+    );
+    if (!acquired.success) {
+      session.sendError('session_created', acquired.error, payload.requestId);
+      return;
+    }
+    ownsDevice = acquired.ownedBySession === true;
+    device.state = 'Booted';
+  }
+
+  session.assignEmulator(null, udid, false); // never use Android stop path for iOS
+  sessionManager.assignDevice(session.id, udid);
+  bindIosSession(session, device, { ownsDevice });
+
+  logger.info('iOS session created', { sessionId: session.id, udid, name: device.name, ownsDevice });
+
+  session.sendSuccess('session_created', {
+    session_id: session.id,
+    device_id: udid,
+    emulator_name: device.name,
+    platform: 'ios',
+    already_running: !ownsDevice
+  }, payload.requestId);
+}
+
+/** Route control to PlatformHost providers with legacy capture fallback. */
+async function routeControl(sessionId, event) {
+  const binding = platformHost.getSessionBinding(sessionId);
+  if (binding?.controlProvider) {
+    return binding.controlProvider.inject(binding.handle, event);
+  }
+  return controlRouter.handleControl(sessionId, event);
+}
+
+/**
+ * Stop stream and release the device bound to the session.
  */
 async function releaseSessionDevice(session, { killEmulator = KILL_EMULATOR_ON_DISCONNECT } = {}) {
   if (session.streamState !== 'idle') {
-    streamManager.stopStream(session.id);
+    await streamManager.stopStream(session.id);
     webrtcSignaling.closeSession(session.id);
     session.cleanupStream();
   }
@@ -59,6 +228,16 @@ async function releaseSessionDevice(session, { killEmulator = KILL_EMULATOR_ON_D
   const deviceId = session.deviceId;
   const emulatorName = session.emulatorName;
   const ownsEmulator = session.ownsEmulator;
+
+  // iOS simulators are managed via simctl, not emulatorManager. Just unbind the
+  // control plane; leave the simulator booted for the farm (release policy lives
+  // in SimulatorLifecycleProvider and is intentionally non-destructive).
+  if (session.deviceHandle?.ref?.platform === 'ios') {
+    platformHost.unbindSession(session.id);
+    session.deviceHandle = null;
+    sessionManager.clearDevice(session.id);
+    return { released: true, deviceId, emulatorName: null, emulatorKilled: false };
+  }
 
   if (killEmulator && ownsEmulator) {
     const result = await emulatorManager.stopEmulator(deviceId, session.id);
@@ -73,6 +252,8 @@ async function releaseSessionDevice(session, { killEmulator = KILL_EMULATOR_ON_D
     emulatorManager.unbindEmulator(deviceId, session.id);
   }
 
+  platformHost.unbindSession(session.id);
+  session.deviceHandle = null;
   sessionManager.clearDevice(session.id);
 
   return {
@@ -102,13 +283,11 @@ const messageHandlers = {
   },
 
   /**
-   * Create session with device/emulator binding
-   * Main entry point for clients to get an emulator
-   * Accepts either an AVD name (to start) or a device_id (to bind to existing)
+   * Create session with Android device/emulator binding.
    */
   create_session: async (session, payload) => {
     const { device, options = {} } = payload;
-    
+
     if (!device) {
       session.sendError('session_created', 'device (emulator name or device_id) is required', payload.requestId);
       return;
@@ -126,6 +305,12 @@ const messageHandlers = {
 
     if (session.deviceId) {
       await releaseSessionDevice(session, { killEmulator: KILL_EMULATOR_ON_DISCONNECT });
+    }
+
+    // iOS simulator (UUID device id) → dedicated boot/bind flow.
+    if (isIosUdid(device)) {
+      await createIosSession(session, device, options, payload);
+      return;
     }
 
     // Check if 'device' is actually a device_id of an already running device
@@ -185,6 +370,7 @@ const messageHandlers = {
 
           session.assignEmulator(avdName, startResult.deviceId, !startResult.alreadyRunning);
           sessionManager.assignDevice(session.id, startResult.deviceId);
+          bindPlatformSession(session, startResult.deviceId, { ownsDevice: !startResult.alreadyRunning });
 
           session.sendSuccess('session_created', {
             session_id: session.id,
@@ -214,6 +400,7 @@ const messageHandlers = {
       // Bind to session (ownsEmulator = false since we didn't start it)
       session.assignEmulator(null, device, false);
       sessionManager.assignDevice(session.id, device);
+      bindPlatformSession(session, device, { ownsDevice: false });
       
       logger.info(`Session bound to existing device`, {
         sessionId: session.id,
@@ -252,6 +439,7 @@ const messageHandlers = {
     // Bind to session
     session.assignEmulator(device, result.deviceId, true);
     sessionManager.assignDevice(session.id, result.deviceId);
+    bindPlatformSession(session, result.deviceId, { ownsDevice: true });
 
     logger.info(`Session created with device`, {
       sessionId: session.id,
@@ -337,7 +525,7 @@ const messageHandlers = {
       // Assign the emulator to this session
       session.assignEmulator(emulator_name, result.deviceId, !result.alreadyRunning);
       sessionManager.assignDevice(session.id, result.deviceId);
-      
+      bindPlatformSession(session, result.deviceId, { ownsDevice: !result.alreadyRunning });
       session.sendSuccess('emulator_started', {
         emulator_name,
         device_id: result.deviceId,
@@ -382,11 +570,11 @@ const messageHandlers = {
   },
 
   /**
-   * Get connected devices
+   * Get connected Android devices and emulators.
    */
   get_devices: async (session, payload) => {
-    const result = await buildDeviceCatalog();
-    
+    const result = await platformHost.listDevices();
+
     if (result.success) {
       session.sendSuccess('devices_list', {
         devices: result.devices,
@@ -528,27 +716,40 @@ const messageHandlers = {
    */
   screenshot: async (session, payload) => {
     const deviceId = payload.device_id || session.deviceId;
-    const { local_path } = payload;
-    
+    const { local_path: localPathHint } = payload;
+
     if (!deviceId) {
       session.sendError('screenshot_taken', 'device_id is required or no device assigned to session', payload.requestId);
       return;
     }
-    
-    if (!local_path) {
-      session.sendError('screenshot_taken', 'local_path is required', payload.requestId);
+
+    const fileName = localPathHint
+      ? path.basename(localPathHint)
+      : `emustream_${Date.now()}.png`;
+    const tempPath = path.join(os.tmpdir(), `emu-screenshot-${Date.now()}-${fileName}`);
+
+    // Capture on the server host, then return PNG bytes so the desktop client
+    // can save to the user's local Desktop (works when client and server differ).
+    const result = isIosUdid(deviceId)
+      ? await simctl.screenshot(deviceId, tempPath)
+      : await adb.takeScreenshot(deviceId, tempPath);
+
+    if (!result.success) {
+      session.sendError('screenshot_taken', result.error, payload.requestId);
       return;
     }
-    
-    const result = await adb.takeScreenshot(deviceId, local_path);
-    
-    if (result.success) {
+
+    try {
+      const imageBase64 = (await fs.readFile(tempPath)).toString('base64');
       session.sendSuccess('screenshot_taken', {
         device_id: deviceId,
-        path: result.output
+        filename: fileName,
+        image_base64: imageBase64
       }, payload.requestId);
-    } else {
-      session.sendError('screenshot_taken', result.error, payload.requestId);
+    } catch (err) {
+      session.sendError('screenshot_taken', err.message, payload.requestId);
+    } finally {
+      await fs.unlink(tempPath).catch(() => {});
     }
   },
 
@@ -605,16 +806,29 @@ const messageHandlers = {
       return;
     }
 
-    // Check if already streaming
+    // ── Force-restart strategy ────────────────────────────────────────────────
+    // If a previous stream is still active (double-trigger from the client,
+    // race condition between 'stream_stopped' and the next 'start_stream', or
+    // an orphaned state left by an unclean disconnect) we tear it down first
+    // rather than refusing with an error.  This makes the handler idempotent:
+    // the client can always call start_stream and get a fresh stream.
     if (session.streamState === 'streaming' || session.streamState === 'starting') {
-      session.sendError('stream_started', `Stream already ${session.streamState}`, payload.requestId);
-      return;
+      logger.warn('start_stream: active stream detected — force-tearing down before restart', {
+        sessionId: session.id,
+        deviceId:  session.deviceId,
+        streamState: session.streamState
+      });
+      await streamManager.stopStream(session.id);
+      webrtcSignaling.closeSession(session.id);
+      session.cleanupStream();
     }
+
+    await _prepareAndroidCaptureRestart(session.deviceId);
 
     // Set stream state to starting
     session.setStreamState('starting');
 
-    logger.info('Starting server WebRTC stream (adb screenrecord)', {
+    logger.info('Starting server WebRTC stream', {
       sessionId: session.id,
       deviceId: session.deviceId
     });
@@ -637,13 +851,18 @@ const messageHandlers = {
       sdpLength: offer?.sdp?.length
     });
 
+    // Persist the resolved provider so other response paths can reference it.
+    session.captureProvider = streamResult.captureProvider || 'unknown';
+
     session.sendSuccess('stream_started', {
-      session_id: session.id,
-      device_id: session.deviceId,
-      stream_state: session.streamState,
-      stream_mode: 'server_webrtc_screenrecord',
-      webrtc_offer: offer,
-      message: 'adb screenrecord → H.264 RTP (werift). Send webrtc_answer + ICE.'
+      session_id:      session.id,
+      device_id:       session.deviceId,
+      stream_state:    session.streamState,
+      stream_mode:     `server_webrtc_${session.captureProvider}`,
+      capture_provider: session.captureProvider,
+      stream_meta:     streamResult.streamMeta || null,
+      webrtc_offer:    offer,
+      message:         `${session.captureProvider} → H.264 RTP (werift). Send webrtc_answer + ICE.`
     }, payload.requestId);
   },
 
@@ -662,17 +881,20 @@ const messageHandlers = {
     // Set stream state to stopping
     session.setStreamState('stopping');
 
-    streamManager.stopStream(session.id);
+    await streamManager.stopStream(session.id);
     webrtcSignaling.closeSession(session.id);
     session.cleanupStream();
+
+    await _prepareAndroidCaptureRestart(session.deviceId);
 
     logger.info('Stream stopped', { sessionId: session.id });
 
     session.sendSuccess('stream_stopped', {
-      session_id: session.id,
-      stream_state: session.streamState,
-      stream_mode: 'server_webrtc_screenrecord',
-      message: 'Server screenrecord WebRTC stream stopped'
+      session_id:       session.id,
+      stream_state:     session.streamState,
+      stream_mode:      `server_webrtc_${session.captureProvider || 'unknown'}`,
+      capture_provider: session.captureProvider || 'unknown',
+      message:          'Server WebRTC stream stopped'
     }, payload.requestId);
   },
 
@@ -684,12 +906,12 @@ const messageHandlers = {
     const runtime = controlRouter.getRuntime(session.id);
 
     session.sendSuccess('stream_status', {
-      session_id: session.id,
-      device_id: session.deviceId,
-      stream_state: session.streamState,
-      stream_mode: 'server_webrtc_screenrecord',
-      capture: 'adb exec-out screenrecord → H.264 → werift RTP',
-      stream_active: streamManager.hasSession(session.id),
+      session_id:       session.id,
+      device_id:        session.deviceId,
+      stream_state:     session.streamState,
+      stream_mode:      `server_webrtc_${session.captureProvider || 'unknown'}`,
+      capture_provider: session.captureProvider || 'unknown',
+      stream_active:    streamManager.hasSession(session.id),
       stream_info: session.getStreamInfo(),
       signaling: signalingState ? {
         state: signalingState.state,
@@ -740,11 +962,13 @@ const messageHandlers = {
     webrtcSignaling.handleAnswer(session.id, sdp);
 
     if (!streamManager.hasSession(session.id)) {
-      session.sendError(
-        'webrtc_answer_received',
-        'No active stream. Call start_stream first and wait for stream_started.',
-        payload.requestId
-      );
+      // Same capture-exit race as for ICE: session was torn down by the time
+      // the answer arrived.  Acknowledge silently — stream_error is in flight.
+      logger.debug('WebRTC answer dropped — no active stream session', { sessionId: session.id });
+      session.sendSuccess('webrtc_answer_received', {
+        session_id: session.id,
+        message: 'no active stream — answer dropped'
+      }, payload.requestId);
       return;
     }
 
@@ -752,9 +976,10 @@ const messageHandlers = {
     if (relay.success) {
       session.setStreamState('streaming');
       session.sendSuccess('webrtc_answer_received', {
-        session_id: session.id,
-        stream_mode: 'server_webrtc_screenrecord',
-        message: 'Answer applied — server is sending screenrecord H.264 over WebRTC'
+        session_id:      session.id,
+        stream_mode:     `server_webrtc_${session.captureProvider || 'unknown'}`,
+        capture_provider: session.captureProvider || 'unknown',
+        message:         `Answer applied — ${session.captureProvider || 'unknown'} → H.264 RTP is live`
       }, payload.requestId);
     } else {
       session.sendError('webrtc_answer_received', relay.error, payload.requestId);
@@ -776,7 +1001,7 @@ const messageHandlers = {
       return;
     }
 
-    const result = await controlRouter.handleControl(session.id, event);
+    const result = await routeControl(session.id, event);
 
     if (result.success) {
       session.sendSuccess('control_result', {
@@ -797,14 +1022,27 @@ const messageHandlers = {
     const controlStats = controlRouter.getStats(session.id);
 
     session.sendSuccess('stream_stats', {
-      session_id: session.id,
-      stream_state: session.streamState,
-      stream_mode: 'server_webrtc_screenrecord',
-      stream_active: streamManager.hasSession(session.id),
+      session_id:       session.id,
+      stream_state:     session.streamState,
+      stream_mode:      `server_webrtc_${session.captureProvider || 'unknown'}`,
+      capture_provider: session.captureProvider || 'unknown',
+      stream_active:    streamManager.hasSession(session.id),
       runtime: runtime ? runtime.getStatus() : null,
       pipeline: streamManager.getStats(session.id),
       control: controlStats
     }, payload.requestId);
+  },
+
+  /**
+   * Force an IDR on the active capture (renegotiation / late decoder sync).
+   */
+  request_keyframe: async (session, payload) => {
+    const result = streamManager.requestKeyframe(session.id);
+    if (result.success) {
+      session.sendSuccess('keyframe_requested', { session_id: session.id }, payload.requestId);
+    } else {
+      session.sendError('keyframe_requested', result.error, payload.requestId);
+    }
   },
 
   /**
@@ -823,11 +1061,15 @@ const messageHandlers = {
     webrtcSignaling.handleIceCandidate(session.id, candidate);
 
     if (!streamManager.hasSession(session.id)) {
-      session.sendError(
-        'ice_candidate_received',
-        'No active stream. Call start_stream and wait for stream_started before sending ICE.',
-        payload.requestId
-      );
+      // Session may have been torn down by a capture-exit race (capture dies in
+      // < 1 RTT so the client's ICE arrives after stopStream deleted the entry).
+      // Acknowledge silently — the stream_error already in flight will tell the
+      // client to reconnect; rejecting ICE here only adds confusing log noise.
+      logger.debug('ICE candidate dropped — no active stream session', { sessionId: session.id });
+      session.sendSuccess('ice_candidate_received', {
+        session_id: session.id,
+        message: 'no active stream — candidate dropped'
+      }, payload.requestId);
       return;
     }
 
@@ -922,20 +1164,22 @@ async function startServer() {
 
   // Set up session removal callback for cleanup
   sessionManager.onSessionRemove(async (sessionId, session, options) => {
-    // Clean up stream resources if active
+    // Clean up stream resources if active (same for all platforms).
     if (session.streamState && session.streamState !== 'idle') {
-      logger.info(`Session removal - cleaning up stream`, { sessionId, streamState: session.streamState });
-      streamManager.stopStream(sessionId);
+      logger.info('Session removal - cleaning up stream', { sessionId, streamState: session.streamState });
+      await streamManager.stopStream(sessionId);
       webrtcSignaling.closeSession(sessionId);
     }
 
-    // Clean up emulator if owned by session
+    platformHost.unbindSession(sessionId);
+
     if (session.ownsEmulator && session.deviceId) {
       const killEmulator = options.killEmulator !== false && KILL_EMULATOR_ON_DISCONNECT;
-      
-      logger.info(`Session removal - cleaning up emulator`, {
+
+      logger.info('Session removal - cleaning up device', {
         sessionId,
         deviceId: session.deviceId,
+        platform: 'android',
         killEmulator
       });
 
@@ -958,8 +1202,10 @@ async function startServer() {
     
     // Set up heartbeat
     ws.isAlive = true;
+    ws.missedPongs = 0;
     ws.on('pong', () => {
       ws.isAlive = true;
+      ws.missedPongs = 0;
     });
     
     // Serialize message handling so ICE/answer cannot race with in-flight start_stream.
@@ -1000,11 +1246,18 @@ async function startServer() {
   const heartbeatInterval = setInterval(() => {
     wss.clients.forEach(async (ws) => {
       if (ws.isAlive === false) {
+        ws.missedPongs = (ws.missedPongs || 0) + 1;
+        if (ws.missedPongs < WS_MAX_MISSED_PONGS) {
+          ws.ping();
+          return;
+        }
+
         const session = sessionManager.getSessionByWs(ws);
         if (session) {
-          logger.info('Terminating inactive connection', { 
+          logger.info('Terminating inactive connection', {
             sessionId: session.id,
-            hadDevice: !!session.deviceId 
+            hadDevice: !!session.deviceId,
+            missedPongs: ws.missedPongs
           });
           await sessionManager.removeSession(session.id, {
             killEmulator: KILL_EMULATOR_ON_DISCONNECT
@@ -1012,7 +1265,8 @@ async function startServer() {
         }
         return ws.terminate();
       }
-      
+
+      ws.missedPongs = 0;
       ws.isAlive = false;
       ws.ping();
     });
@@ -1022,6 +1276,27 @@ async function startServer() {
   const cleanupInterval = setInterval(() => {
     sessionManager.cleanupStaleSessions();
   }, SESSION_CLEANUP_INTERVAL);
+
+  // Soak diagnostics — periodic RSS/heap/uptime + active session count. Enables
+  // long-run (24/48/72h) leak/regression tracking on the farm. Set SOAK_LOG_MS=0
+  // to disable. Default 0 (off) to keep normal logs quiet.
+  const soakMs = parseInt(process.env.SOAK_LOG_MS, 10) || 0;
+  let soakInterval = null;
+  if (soakMs > 0) {
+    soakInterval = setInterval(() => {
+      const m = process.memoryUsage();
+      const mb = (b) => Math.round(b / 1024 / 1024);
+      logger.info('Soak diagnostics', {
+        uptimeSec: Math.round(process.uptime()),
+        rssMB: mb(m.rss),
+        heapUsedMB: mb(m.heapUsed),
+        externalMB: mb(m.external),
+        activeHandlesMB: mb(m.arrayBuffers || 0),
+        sessions: sessionManager.getStats?.()?.active ?? null
+      });
+    }, soakMs);
+    if (soakInterval.unref) soakInterval.unref();
+  }
   
   // Handle server errors
   wss.on('error', (error) => {
@@ -1034,6 +1309,7 @@ async function startServer() {
     
     clearInterval(heartbeatInterval);
     clearInterval(cleanupInterval);
+    if (soakInterval) clearInterval(soakInterval);
     
     // Close all WebSocket connections
     wss.clients.forEach((ws) => {
@@ -1066,7 +1342,7 @@ async function startServer() {
     logger.info(`Server started`, { host: HOST, port: PORT });
     logger.info(`WebSocket endpoint: ws://${HOST}:${PORT}`);
     logger.info(`Health check: http://${HOST}:${PORT}/health`);
-    logger.info('Stream — server WebRTC (werift) + adb screenrecord', {
+    logger.info('Stream — server WebRTC (werift) | Android: scrcpy → adb-screenrecord fallback', {
       resolution: `${streamConfig.width}x${streamConfig.height}`,
       fps: streamConfig.fps,
       codec: 'H264'

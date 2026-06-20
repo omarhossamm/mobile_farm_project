@@ -6,16 +6,19 @@ using System.Threading.Tasks;
 namespace EmulatorDesktopApp.Services
 {
     /// <summary>
-    /// Sends remote control events to the gateway over WebSocket (separate from WebRTC video).
+    /// Sends remote control events via WebRTC DataChannel (primary) or WebSocket fallback.
     /// </summary>
     public class RemoteControlService
     {
         private readonly WebSocketService _webSocket;
+        private WebRTCClient? _webrtc;
 
         public RemoteControlService(WebSocketService webSocket)
         {
             _webSocket = webSocket ?? throw new ArgumentNullException(nameof(webSocket));
         }
+
+        public void AttachWebRtc(WebRTCClient webRtc) => _webrtc = webRtc;
 
         public Task SendTapAsync(double normalizedX, double normalizedY)
         {
@@ -45,7 +48,30 @@ namespace EmulatorDesktopApp.Services
             return SendControlAsync(new { action = "key", keyCode });
         }
 
-        private async Task SendControlAsync(object controlEvent)
+        public Task SendTextAsync(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return Task.CompletedTask;
+
+            return SendControlAsync(new { action = "text", text });
+        }
+
+        /// <summary>
+        /// iOS App Switcher. Home-indicator edge swipes are SpringBoard system
+        /// gestures; the gateway maps this to a double Home-button press.
+        /// </summary>
+        public Task SendAppSwitcherAsync() =>
+            SendControlAsync(new { action = "appSwitcher" });
+
+        private Task SendControlAsync(object controlEvent)
+        {
+            if (_webrtc?.TrySendControlViaDataChannel(controlEvent) == true)
+                return Task.CompletedTask;
+
+            return SendControlViaWebSocketAsync(controlEvent);
+        }
+
+        private async Task SendControlViaWebSocketAsync(object controlEvent)
         {
             if (!_webSocket.IsConnected)
                 return;

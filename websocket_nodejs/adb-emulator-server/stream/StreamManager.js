@@ -18,6 +18,7 @@ const {
 } = require('./media/h264');
 const { OutputPacer } = require('./OutputPacer');
 const {
+  STATE,
   createMediaStartupGate,
   snapshot,
   tryOpen,
@@ -26,10 +27,12 @@ const {
 const { controlRouter } = require('../control/ControlRouter');
 const { streamConfig } = require('../lib/config');
 const { createLogger } = require('../lib/logger');
+const { StreamTimeline } = require('./core/StreamTimeline');
+const { buildStreamMeta } = require('./core/buildStreamMeta');
 
 const logger = createLogger('STREAM_MGR');
 const CODEC_WAIT_MS = parseInt(process.env.STREAM_CODEC_WAIT_MS, 10) || 30000;
-const DECODER_WARMUP_MS = clampInt(parseInt(process.env.STREAM_DECODER_WARMUP_MS, 10), 500, 100, 2000);
+const DECODER_WARMUP_MS = clampInt(parseInt(process.env.STREAM_DECODER_WARMUP_MS, 10), 150, 100, 2000);
 
 /**
  * Periodic STAP-A (SPS+PPS) refresh interval. Defaults to 2 s — without this
@@ -45,6 +48,20 @@ const PARAM_REFRESH_MS = clampInt(parseInt(process.env.STREAM_PARAM_REFRESH_MS, 
  * glance — invaluable when diagnosing intermittent decoder corruption.
  */
 const HEARTBEAT_MS = clampInt(parseInt(process.env.STREAM_HEARTBEAT_MS, 10), 5000, 1000, 60000);
+
+/**
+ * How long (ms) the pacer can be idle after the gate opens before a
+ * `stream_stall` WebSocket message is sent to the desktop.  This lets the
+ * client overlay a visual indicator instead of showing a frozen frame.
+ * Defaults to 500 ms — slightly above the capture STALL_RECOVERY_MS (400 ms)
+ * to avoid false positives from normal IDR spacing.
+ */
+const STALL_NOTIFY_MS = clampInt(
+  parseInt(process.env.STREAM_STALL_NOTIFY_MS, 10),
+  2000,
+  500,
+  10000
+);
 
 function clampInt(value, fallback, lo, hi) {
   if (!Number.isFinite(value)) return fallback;
@@ -71,6 +88,33 @@ function detectH264Format(chunk) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Build a minimal DeviceHandle for Android sessions that were created before
+ * platformHost.bindSession() was called (the legacy create_session path).
+ * Enough for ProviderRegistry.resolveCapture() to probe in priority order.
+ *
+ * @param {string} deviceId   ADB serial (e.g. 'emulator-5554', '192.168.1.5:5555')
+ * @param {object} session    WebSocket session object
+ * @returns {import('../platform/types').DeviceHandle}
+ */
+function _makeAndroidHandle(deviceId, session) {
+  // Heuristic: emulator-NNNN → 'emulator',  HOST:PORT → 'physical'
+  const targetClass = deviceId.startsWith('emulator-') ? 'emulator'
+    : deviceId.includes(':') ? 'physical'
+    : (session.metadata?.targetClass || 'emulator');
+
+  return {
+    ref: {
+      id:          deviceId,
+      platform:    'android',
+      targetClass,
+      status:      'online',
+      displayName: deviceId
+    },
+    sessionId: session.id
+  };
 }
 
 class StreamManager {
@@ -168,6 +212,10 @@ class StreamManager {
       nextRtpTimestamp: state.nextRtpTimestamp
     });
 
+    if (typeof entry.capture?.requestKeyframe === 'function') {
+      entry.capture.requestKeyframe();
+    }
+
     this._startDecoderWarmup(entry, sessionId, reason);
     return gate.open;
   }
@@ -210,13 +258,15 @@ class StreamManager {
     const { gate, ctx } = entry;
     if (!tryOpen(gate, reason)) return;
 
+    entry.gateOpenAt = Date.now();
     entry.rtpSendEnabled = true;
     ctx.options.emitRtp = true;
     entry.pacer.setEnabled(true);
 
-    const flushed = enableRtpEmit(ctx);
-    for (const frame of flushed) {
-      entry.deliverFrame(frame);
+    tickAnnexBDrain(ctx);
+    const discarded = enableRtpEmit(ctx);
+    if (discarded > 0) {
+      logger.info('Pre-gate buffer discarded — burst prevention', { sessionId, discarded });
     }
 
     if (!entry.pacerStarted) {
@@ -246,6 +296,25 @@ class StreamManager {
         entry.heartbeatTimer.unref();
       }
     }
+
+    if (!entry.stallNotifyTimer) {
+      entry.stallNotifyTimer = setInterval(() => {
+        if (!entry.gate.open) return;
+        if (!entry.capture.getStatus().running) return;
+        const idleMs = entry.lastVclSentAt > 0 ? Date.now() - entry.lastVclSentAt : 0;
+        const isStalling = idleMs > STALL_NOTIFY_MS;
+        if (isStalling && !entry.stallIsNotified) {
+          entry.stallIsNotified = true;
+          const sess = entry.session;
+          if (sess?.ws?.readyState === 1) {
+            try { sess.send({ type: 'stream_stall', session_id: sessionId, idleMs }); } catch (_) {}
+          }
+        }
+      }, 200);
+      if (typeof entry.stallNotifyTimer.unref === 'function') {
+        entry.stallNotifyTimer.unref();
+      }
+    }
   }
 
   /**
@@ -258,40 +327,67 @@ class StreamManager {
   _emitHeartbeat(entry, sessionId) {
     if (!entry || !this._sessions.has(sessionId)) return;
     try {
+      const now = Date.now();
       const pacer = entry.pacer.stats;
       const h264 = entry.ctx.stats;
       const peer = peerConnectionManager.getStats(sessionId) || {};
-      const capture = entry.capture.getStatus()?.stats || {};
+      const captureStatus = entry.capture.getStatus() || {};
+      const capture = captureStatus.stats || {};
       const idr = h264.keyframesWithSpsPps || 0;
       const sent = pacer.sent || 0;
 
+      const spsInfo = getProcessorState(entry)?.spsInfo ?? null;
+
+      // Per-heartbeat-window observed FPS (frames sent / window seconds).
+      const windowSent = sent - (entry.prevHeartbeatSent || 0);
+      const windowMs = entry.prevHeartbeatAt ? now - entry.prevHeartbeatAt : HEARTBEAT_MS;
+      const windowFps = windowMs > 0 ? Math.round((windowSent / windowMs) * 1000 * 10) / 10 : 0;
+      entry.prevHeartbeatSent = sent;
+      entry.prevHeartbeatAt = now;
+
+      // Startup timing (null until gate opens / first frame fires).
+      const startupTimeMs = (entry.gateOpenAt && entry.firstFrameEmittedAt)
+        ? entry.firstFrameEmittedAt - entry.gateOpenAt
+        : null;
+      const totalStartMs = entry.firstFrameEmittedAt
+        ? entry.firstFrameEmittedAt - entry.streamStartAt
+        : null;
+
       logger.info('Frame send heartbeat', {
         sessionId,
+        captureProvider: entry.capture?.providerId ?? captureStatus.mode ?? 'unknown',
         sent,
         idrSent: idr,
         pSent: Math.max(0, sent - idr),
+        windowFps,
+        startupTimeMs,
+        totalStartMs,
+        spsNumRefFrames: spsInfo?.numRefFrames ?? null,
+        spsProfile: spsInfo?.profileIdc ?? null,
+        spsLevel: spsInfo?.levelIdc ?? null,
         droppedAtIdr: pacer.droppedAtIdr || 0,
         droppedNoIdrFallback: pacer.droppedNoIdrFallback || 0,
         idleRepeats: pacer.idleRepeats || 0,
         sendMode: pacer.mode || 'immediate',
         queueDepth: pacer.queueDepth || 0,
         queueDepthPeak: pacer.queueDepthPeak || 0,
-        maxDrainPerTick: pacer.maxDrainPerTick || 0,
         pacerFps: pacer.fps || 0,
-        pacerQueueCap: pacer.queueCap || 0,
         lastDropReason: pacer.lastDropReason || null,
         captureStallRecoveries: h264.captureStallRecoveries || 0,
         stalePartialDiscarded: h264.stalePartialDiscarded || 0,
         partialPFrameRetained: h264.partialPFrameRetained || 0,
         idlePFrameDrain: h264.idlePFrameDrain || 0,
+        skippedTinyPFrames: h264.skippedTinyPFrames || 0,
         deferredIdrNoParams: h264.deferredIdrNoParams || 0,
+        discardedPreGateFrames: h264.discardedPreGateFrames || 0,
         framesEmitted: h264.framesEmitted || 0,
         keyframesWithSpsPps: h264.keyframesWithSpsPps || 0,
         chunksReceived: h264.chunksReceived || 0,
-        chunksAboveDrainGate: h264.chunksAboveDrainGate || 0,
         maxChunkGapMs: h264.maxChunkGapMs || 0,
         maxChunkBytes: h264.maxChunkBytes || 0,
         captureBytes: capture.bytes || 0,
+        captureChunks: capture.chunks || 0,
+        ffmpegStderrErrors: capture.ffmpegStderrErrors || 0,
         rtpFrames: peer.framesSent || 0,
         rtpPackets: peer.packetsSent || 0
       });
@@ -369,6 +465,135 @@ class StreamManager {
     return false;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Capture event wiring
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Wire data + lifecycle events for a capture stream onto an existing
+   * session entry.
+   *
+   * @param {object} entry        Session entry from this._sessions
+   * @param {object} capture      The capture stream to wire
+   * @param {string} sessionId
+   * @param {object} state        H.264 processor state (same object throughout)
+   * @param {object} ctx          H.264 processor context
+   */
+  /** Single ingestion point for capture chunks (live + supervised replay). */
+  _ingestChunk(state, ctx, sessionId, chunk) {
+    if (!state.formatDetected && chunk.length > 0) {
+      state.format = detectH264Format(chunk);
+      state.formatDetected = true;
+      logger.info('H.264 format detected', { sessionId, format: state.format });
+    }
+    processH264Chunk(ctx, chunk);
+  }
+
+  _wireCaptureEvents(entry, capture, sessionId, state, ctx) {
+    const providerId = capture.providerId;
+
+    if (!entry.timeline) {
+      entry.timeline = new StreamTimeline(sessionId);
+    }
+    entry.timeline.emit('capture.started', { provider: providerId });
+
+    capture.on('data', (chunk) => this._ingestChunk(state, ctx, sessionId, chunk));
+
+    capture.on('ended', (info) => {
+      this._handleCaptureEnded(sessionId, info);
+    });
+
+    capture.on('recovered', (info) => {
+      logger.info('Capture recovered after stall — resetting codec state', {
+        sessionId,
+        provider: providerId,
+        ...info
+      });
+      this._resetCaptureState(entry);
+      const sess = entry.session;
+      if (sess?.ws?.readyState === 1) {
+        try { sess.send({ type: 'scene_cut', session_id: sessionId }); } catch (_) {}
+      }
+      this._tryCompleteStartup(sessionId, 'capture_recovered').catch((err) => {
+        logger.error('Startup failed after capture recovery', { sessionId, error: err.message });
+      });
+    });
+
+    capture.on('error', (err) => {
+      logger.error('Capture error — treating as fatal', { sessionId, error: err.message });
+      this._handleCaptureEnded(sessionId, { reason: 'capture_error', error: err.message });
+    });
+  }
+
+  /**
+   * Reset all H.264 codec state so a newly-started capture provider produces
+   * a clean SPS+PPS+IDR sequence without contamination from the old encoder.
+   *
+   * Mutates `entry.ctx.state` and `entry.gate` in-place — the existing object
+   * references held by closures remain valid throughout the reset.
+   *
+   * Gate flags that reflect network signalling (sdpLocalReady, sdpRemoteReady,
+   * dtlsReady) are intentionally left untouched: the peer connection is still
+   * alive and those handshakes do NOT need to repeat.
+   *
+   * @param {object} entry  Session entry from this._sessions
+   */
+  _resetCaptureState(entry) {
+    const { ctx, gate } = entry;
+    const state = ctx.state;
+
+    // Cancel any in-flight timers so they don't fire on stale state.
+    if (state.reactiveDrainTimer) {
+      clearTimeout(state.reactiveDrainTimer);
+      state.reactiveDrainTimer = null;
+    }
+    if (entry.decoderWarmupTimer) {
+      clearTimeout(entry.decoderWarmupTimer);
+      entry.decoderWarmupTimer = null;
+    }
+
+    // ── H.264 processor state ─────────────────────────────────────────────
+    // Wipe the byte buffer — any partial NAL from the old encoder is garbage
+    // to the new encoder and would corrupt the first decoded frame.
+    state.buffer              = Buffer.alloc(0);
+    state.auNals              = [];
+    state.gotFirstKeyframe    = false;
+    state.lastKeyframeEmitAt  = 0;
+    state.framesOut           = 0;
+    state.firstLiveFrameEmitted = false;
+    state.formatDetected      = false;
+    state.paramSetsRtpSent    = false;
+    state.pendingRtpFrames    = [];
+    state.lastChunkSize       = 0;
+    state.afterStall          = false;
+
+    // ── Param-set cache ───────────────────────────────────────────────────
+    // SPS / PPS from the old encoder are invalid for the new one (different
+    // profile, resolution, or level).  Mirror what initParamSetState() sets.
+    state.receivedSps  = false;
+    state.receivedPps  = false;
+    state.sps          = null;
+    state.pps          = null;
+    state.spsInfo      = null;
+    state.lastSpsRaw   = null;
+    state.lastPpsRaw   = null;
+
+    // ── Media startup gate (codec side only) ──────────────────────────────
+    // Re-enter WAIT_CODEC.  The next provider's SPS+IDR will drive the gate
+    // back through SEND_SPS_PPS → WAIT_DECODER → STREAMING automatically.
+    gate.codecParamsReady = false;
+    gate.paramSetsFlushed = false;
+    gate.decoderReady     = false;
+    gate.open             = false;
+    gate.lastState        = STATE.WAIT_CODEC;
+
+    // ── RTP pipeline ──────────────────────────────────────────────────────
+    entry.rtpSendEnabled         = false;
+    ctx.options.emitRtp          = false;
+    entry.pendingParamSetPackets = null;
+    entry.pacer.setEnabled(false);
+  }
+
   /**
    * Capture has exited (time-limit, crash, device disconnect). Per the
    * single-shot policy we DO NOT restart the encoder. The whole session is
@@ -388,6 +613,10 @@ class StreamManager {
     });
 
     const session = entry.session;
+    const reason = info?.reason || 'unknown';
+    const provider = entry.capture?.providerId ?? 'capture';
+    const errorMsg = `${provider} ended (${reason}). Reconnect required.`;
+
     if (session?.ws?.readyState === 1) {
       try {
         session.send({
@@ -395,7 +624,7 @@ class StreamManager {
           session_id: sessionId,
           fatal: true,
           reason: info?.reason || 'capture_ended',
-          error: `screenrecord ended (${info?.reason || 'unknown'}). Reconnect required.`
+          error: errorMsg
         });
       } catch (err) {
         logger.warn('Failed to notify desktop of capture end', { sessionId, error: err.message });
@@ -410,7 +639,7 @@ class StreamManager {
     const deviceId = session.deviceId;
 
     if (this._sessions.has(sessionId)) {
-      this.stopStream(sessionId);
+      await this.stopStream(sessionId);
     }
 
     const peerResult = peerConnectionManager.createPeer(sessionId);
@@ -421,19 +650,127 @@ class StreamManager {
     peerConnectionManager.attachPeer(sessionId, session);
 
     const fps = options.fps || streamConfig.fps;
-    const capture = createCapture(deviceId, {
-      width: options.width || streamConfig.width,
-      height: options.height || streamConfig.height,
-      bitRate: options.bitRate || streamConfig.recordBitrate,
-      fps
-    });
+
+    // Route ALL capture creation through the ProviderRegistry so that
+    // config/providers.js priority order is honoured for every platform.
+    //
+    // Android sessions arrive without session.deviceHandle (the legacy
+    // createSession path never calls platformHost.bindSession for Android).
+    // We synthesise a minimal DeviceHandle so the registry can probe providers
+    // in the configured priority order (scrcpy-capture → adb-screenrecord).
+    //
+    // Registry sessions carry session.deviceHandle from platformHost.bindSession.
+    const handle = session.deviceHandle ?? _makeAndroidHandle(deviceId, session);
+
+    let capture;
+    let captureProviderId = 'unknown';
+    const isIos = handle.ref.platform === 'ios';
+    const captureOpts = isIos
+      ? {
+          // CoreSimulator/idb capture is native-resolution; width/height are
+          // informational. fps + bitrate drive the VideoToolbox/x264 encoder.
+          bitRate: options.bitRate || streamConfig.iosBitrate,
+          fps:     options.fps     || streamConfig.iosFps
+        }
+      : {
+          maxSize: options.maxSize || streamConfig.androidMaxSize,
+          width:   options.width   || streamConfig.androidWidth,
+          height:  options.height  || streamConfig.androidHeight,
+          bitRate: options.bitRate || streamConfig.androidBitrate,
+          fps:     options.fps     || streamConfig.androidFps || fps
+        };
+
+    // Supervised startup failover (iOS): try the whole probe-passing chain and
+    // verify each candidate actually produces a first frame, transparently
+    // falling back (coresim → idb-transcode) without a client reconnect.
+    let supervised = null;
+
+    {
+      const { platformHost } = require('../platform');
+
+      if (isIos) {
+        let chain;
+        try {
+          chain = await platformHost.registry.resolveCaptureChain(handle);
+        } catch (err) {
+          peerConnectionManager.closePeer(sessionId);
+          if (err.code === 'CAPTURE_PERMISSION_DENIED') {
+            return { success: false, reason: 'permission_denied', error: err.message };
+          }
+          return { success: false, error: `No capture provider available: ${err.message}` };
+        }
+        if (!chain.length) {
+          peerConnectionManager.closePeer(sessionId);
+          return { success: false, error: 'No capture provider available for iOS simulator' };
+        }
+        try {
+          const { CaptureSupervisor } = require('./core/CaptureSupervisor');
+          supervised = await new CaptureSupervisor().selectAndStart({ chain, handle, captureOpts });
+        } catch (err) {
+          peerConnectionManager.closePeer(sessionId);
+          logger.error('iOS capture supervisor failed', { sessionId, error: err.message });
+          return { success: false, error: `Capture start failed: ${err.message}` };
+        }
+        capture = supervised.capture;
+        captureProviderId = supervised.providerId;
+      } else {
+        let provider;
+        try {
+          provider = await platformHost.registry.resolveCapture(handle);
+        } catch (err) {
+          peerConnectionManager.closePeer(sessionId);
+
+          if (err.code === 'CAPTURE_PERMISSION_DENIED') {
+            logger.warn('Capture blocked: permission denied', {
+              sessionId,
+              providerId: err.providerId,
+              error: err.message
+            });
+            return { success: false, reason: 'permission_denied', error: err.message };
+          }
+
+          logger.error('No capture provider resolved', { sessionId, error: err.message });
+          return { success: false, error: `No capture provider available: ${err.message}` };
+        }
+
+        captureProviderId = provider.providerId;
+
+        try {
+          capture = await provider.startCapture(handle, captureOpts);
+        } catch (err) {
+          peerConnectionManager.closePeer(sessionId);
+          logger.error('Capture failed to start', { sessionId, providerId: captureProviderId, error: err.message });
+          return { success: false, error: `Capture start failed (${captureProviderId}): ${err.message}` };
+        }
+      }
+
+      logger.info('Capture provider selected', {
+        sessionId,
+        providerId: captureProviderId,
+        platform:   handle.ref.platform,
+        targetClass: handle.ref.targetClass,
+        supervised: !!supervised
+      });
+    }
 
     const packetizer = new H264RtpPacketizer();
     const emitter = new EventEmitter();
     const stats = { bytesIn: 0, nalsParsed: 0, framesEmitted: 0 };
     const state = createStreamProcessorState({ format: 'annexb' });
     const keyframesOnly = options.keyframesOnly ?? streamConfig.keyframesOnly;
-    const ctx = { emitter, packetizer, stats, options: { fps, keyframesOnly, emitRtp: false }, state };
+    const frameDelimited = captureProviderId === 'scrcpy-capture';
+    const ctx = {
+      emitter,
+      packetizer,
+      stats,
+      options: {
+        fps,
+        keyframesOnly,
+        frameDelimited,
+        emitRtp: false
+      },
+      state
+    };
     const gate = createMediaStartupGate(sessionId);
 
     const entry = {
@@ -449,7 +786,15 @@ class StreamManager {
       decoderWarmupTimer: null,
       paramRefreshTimer: null,
       heartbeatTimer: null,
-      captureEndedHandled: false
+      captureEndedHandled: false,
+      timeline: new StreamTimeline(sessionId),
+      // A/B comparison timing
+      streamStartAt: Date.now(),
+      gateOpenAt: 0,
+      firstFrameEmittedAt: 0,
+      // Per-heartbeat-window FPS tracking
+      prevHeartbeatSent: 0,
+      prevHeartbeatAt: 0
     };
 
     entry.sendParamSetPackets = (packets) => {
@@ -490,9 +835,19 @@ class StreamManager {
       entry.pacer.submit(frame);
     };
 
+    entry.lastVclSentAt = 0;
+    entry.stallIsNotified = false;
     entry.pacer = new OutputPacer(fps, (frame) => {
+      entry.lastVclSentAt = Date.now();
+      if (entry.stallIsNotified) {
+        entry.stallIsNotified = false;
+        const sess = entry.session;
+        if (sess?.ws?.readyState === 1) {
+          try { sess.send({ type: 'stream_resumed', session_id: sessionId }); } catch (_) {}
+        }
+      }
       this._sendRtp(entry, sessionId, frame.packets, 'output');
-    }, { idleFill: false });
+    });
     entry.pacer.setEnabled(false);
 
     emitter.on('codecParamsReady', () => {
@@ -515,9 +870,17 @@ class StreamManager {
     });
 
     emitter.on('firstFrame', () => {
+      entry.firstFrameEmittedAt = Date.now();
       const st = getProcessorState(entry);
+      const startupTimeMs = entry.gateOpenAt
+        ? entry.firstFrameEmittedAt - entry.gateOpenAt
+        : null;
+      const totalStartMs = entry.firstFrameEmittedAt - entry.streamStartAt;
       logger.info('First IDR access unit emitted', {
         sessionId,
+        captureProvider: entry.capture?.providerId ?? 'unknown',
+        startupTimeMs,
+        totalStartMs,
         gate: snapshot(gate),
         paramSetsRtpSent: st?.paramSetsRtpSent,
         spsBytes: st?.sps?.length,
@@ -525,49 +888,84 @@ class StreamManager {
       });
     });
 
-    capture.on('data', (chunk) => {
-      if (!state.formatDetected && chunk.length > 0) {
-        state.format = detectH264Format(chunk);
-        state.formatDetected = true;
-        logger.info('H.264 format detected', { sessionId, format: state.format });
-      }
-      processH264Chunk(ctx, chunk);
-    });
-
-    // Single-shot capture policy: any capture termination (clean exit, crash,
-    // device disconnect, spawn failure) is fatal for this session. No
-    // segmentRestart / partial-restart path exists anymore.
-    capture.on('ended', (info) => {
-      this._handleCaptureEnded(sessionId, info);
-    });
-
-    capture.on('error', (err) => {
-      logger.error('Capture error — treating as fatal', { sessionId, error: err.message });
-      this._handleCaptureEnded(sessionId, { reason: 'capture_error', error: err.message });
-    });
+    this._wireCaptureEvents(entry, capture, sessionId, state, ctx);
 
     this._sessions.set(sessionId, entry);
-    controlRouter.registerRuntime(sessionId, capture);
+    // Legacy adb-screenrecord capture objects expose injectInput() directly.
+    // Registry-based providers (scrcpy) use PlatformHost control binding — skip here.
+    if (typeof capture.injectInput === 'function') {
+      controlRouter.registerRuntime(sessionId, capture);
+    }
 
-    capture
-      .start()
-      .then(() => logger.info('Capture parse-only until startup gate opens', { sessionId, deviceId }))
-      .catch((err) => logger.error('Capture start failed', { sessionId, error: err.message }));
+    if (supervised) {
+      // Supervisor already started + verified the capture. Adopt it atomically
+      // (no await before this point): detach the supervisor's buffer listener
+      // and replay the frames captured during verification into the pipeline.
+      capture.removeListener('data', supervised.bufferListener);
+      entry.streamMeta = supervised.streamMeta || entry.streamMeta;
+      for (const chunk of supervised.bufferedChunks) {
+        this._ingestChunk(state, ctx, sessionId, chunk);
+      }
+      logger.info('Supervised capture adopted', {
+        sessionId,
+        captureProvider: captureProviderId,
+        replayedChunks: supervised.bufferedChunks.length
+      });
+    } else {
+      const startResult = await capture.start().catch((err) => {
+        logger.error('Capture start failed', { sessionId, error: err.message });
+        return { success: false, error: err.message };
+      });
+      if (startResult?.success === false) {
+        await this.stopStream(sessionId);
+        return {
+          success: false,
+          error: startResult.error || 'Capture failed to start'
+        };
+      }
+    }
+    logger.info('Capture parse-only until startup gate opens', { sessionId, deviceId });
+
+    if (entry.captureEndedHandled) {
+      logger.warn('Capture ended during start — aborting startStream', {
+        sessionId,
+        captureProvider: captureProviderId
+      });
+      return { success: false, error: 'Capture failed to start — see stream_error for details' };
+    }
 
     const offerResult = await peerConnectionManager.createOffer(sessionId);
     if (!offerResult.success) {
-      this.stopStream(sessionId);
+      await this.stopStream(sessionId);
       return { success: false, error: offerResult.error };
+    }
+
+    // Guard against the race where capture.start() fails fast (e.g. scrcpy
+    // socket_end during offer creation), _handleCaptureEnded fires and removes
+    // the session, but createOffer() has already returned an offer.  Without
+    // this check the server sends stream_started with a valid offer, the client
+    // sends webrtc_answer, and handleAnswer() returns "no active stream".
+    if (entry.captureEndedHandled) {
+      logger.warn('Capture ended before offer was delivered — aborting startStream', {
+        sessionId,
+        captureProvider: captureProviderId
+      });
+      return { success: false, error: 'Capture failed to start — see stream_error for details' };
     }
 
     markFlag(gate, 'sdpLocalReady', true, 'offer_created');
     const sendParams = peerConnectionManager.getVideoSendParams(sessionId);
     if (sendParams) packetizer.configure(sendParams);
 
+    const streamMeta = await buildStreamMeta(handle, capture, captureProviderId);
+    entry.streamMeta = streamMeta;
+    entry.timeline.emit('webrtc.offer_ready', { provider: captureProviderId });
+
     return {
       success: true,
       offer: offerResult.offer,
-      mode: 'server_webrtc_screenrecord'
+      captureProvider: captureProviderId,
+      streamMeta
     };
   }
 
@@ -620,7 +1018,7 @@ class StreamManager {
           sessionId,
           gate: snapshot(entry.gate),
           pacerEnabled: entry.pacer.isEnabled(),
-          captureBytes: entry.capture.getStatus().stats.bytes
+          captureBytes: entry.capture.getStatus()?.stats?.bytes ?? 0
         });
 
         setTimeout(() => {
@@ -629,7 +1027,7 @@ class StreamManager {
               sessionId,
               gate: snapshot(entry.gate),
               h264: entry.ctx.stats,
-              captureBytes: entry.capture.getStatus().stats.bytes
+              captureBytes: entry.capture.getStatus()?.stats?.bytes ?? 0
             });
           }
         }, 3000);
@@ -649,6 +1047,21 @@ class StreamManager {
     return { success: true };
   }
 
+  /**
+   * Force the capture encoder to emit an IDR on its next frame. Used on
+   * renegotiation / late subscriber so the decoder can sync without a full
+   * session rebuild. No-op for captures that don't support it.
+   */
+  requestKeyframe(sessionId) {
+    const entry = this._sessions.get(sessionId);
+    if (!entry) return { success: false, error: 'No stream session' };
+    if (typeof entry.capture.requestKeyframe === 'function') {
+      entry.capture.requestKeyframe();
+      return { success: true };
+    }
+    return { success: false, error: 'capture does not support forced keyframe' };
+  }
+
   getStats(sessionId) {
     const entry = this._sessions.get(sessionId);
     if (!entry) return null;
@@ -661,9 +1074,47 @@ class StreamManager {
     };
   }
 
-  stopStream(sessionId) {
+  async stopStream(sessionId) {
     const entry = this._sessions.get(sessionId);
     if (entry) {
+      // Emit a final session summary for A/B provider comparison before teardown.
+      try {
+        const pacer = entry.pacer.stats;
+        const h264 = entry.ctx.stats;
+        const captureStatus = entry.capture.getStatus() || {};
+        const captureStats = captureStatus.stats || {};
+        const peer = peerConnectionManager.getStats(sessionId) || {};
+        const sessionDurationMs = Date.now() - entry.streamStartAt;
+        const sent = pacer.sent || 0;
+        const overallFps = sessionDurationMs > 0
+          ? Math.round((sent / sessionDurationMs) * 1000 * 10) / 10
+          : 0;
+
+        logger.info('Session summary (A/B comparison)', {
+          sessionId,
+          captureProvider: entry.capture?.providerId ?? captureStatus.mode ?? 'unknown',
+          sessionDurationMs,
+          totalStartMs: entry.firstFrameEmittedAt
+            ? entry.firstFrameEmittedAt - entry.streamStartAt
+            : null,
+          startupTimeMs: (entry.gateOpenAt && entry.firstFrameEmittedAt)
+            ? entry.firstFrameEmittedAt - entry.gateOpenAt
+            : null,
+          sent,
+          idrSent: h264.keyframesWithSpsPps || 0,
+          pSent: Math.max(0, sent - (h264.keyframesWithSpsPps || 0)),
+          overallFps,
+          droppedAtIdr: pacer.droppedAtIdr || 0,
+          discardedPreGateFrames: h264.discardedPreGateFrames || 0,
+          captureStallRecoveries: h264.captureStallRecoveries || 0,
+          ffmpegStderrErrors: captureStats.ffmpegStderrErrors || 0,
+          captureBytes: captureStats.bytes || 0,
+          rtpFrames: peer.framesSent || 0,
+          rtpPackets: peer.packetsSent || 0,
+          spsInfo: getProcessorState(entry)?.spsInfo ?? null
+        });
+      } catch (_) { /* non-fatal — best-effort summary */ }
+
       if (entry.drainTimer) {
         clearInterval(entry.drainTimer);
         entry.drainTimer = null;
@@ -680,9 +1131,29 @@ class StreamManager {
         clearInterval(entry.heartbeatTimer);
         entry.heartbeatTimer = null;
       }
+      if (entry.stallNotifyTimer) {
+        clearInterval(entry.stallNotifyTimer);
+        entry.stallNotifyTimer = null;
+      }
+      if (entry.ctx?.state?.reactiveDrainTimer) {
+        clearTimeout(entry.ctx.state.reactiveDrainTimer);
+        entry.ctx.state.reactiveDrainTimer = null;
+      }
+      if (entry.ctx?.state?.pendingRtpFrames) {
+        entry.ctx.state.pendingRtpFrames = [];
+      }
+      if (entry.capture) {
+        entry.capture.removeAllListeners('data');
+        entry.capture.removeAllListeners('ended');
+        entry.capture.removeAllListeners('recovered');
+        entry.capture.removeAllListeners('error');
+      }
       tickAnnexBDrain(entry.ctx);
       entry.pacer.stop();
-      entry.capture.stop();
+      const stopResult = entry.capture.stop();
+      if (stopResult && typeof stopResult.then === 'function') {
+        await stopResult;
+      }
       controlRouter.unregisterRuntime(sessionId);
       this._sessions.delete(sessionId);
     }

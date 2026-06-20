@@ -6,10 +6,11 @@
         Title="{Binding WindowTitle}"
         Width="417"
         Height="680"
-        MinWidth="417"
+        MinWidth="320"
         MinHeight="480"
         WindowStartupLocation="CenterScreen"
-        Background="#1A1A1A">
+        Background="#1A1A1A"
+        Focusable="True">
 
     <Window.Styles>
         <Style Selector="Button.emu-tool">
@@ -53,14 +54,42 @@
             <Setter Property="Background" Value="#DADCE0" />
             <Setter Property="Margin" Value="10,8" />
         </Style>
+
+        <!-- ── iOS Simulator viewer chrome (iOS only) ─────────────────────── -->
+        <Style Selector="Button.ios-chrome">
+            <Setter Property="Width" Value="30" />
+            <Setter Property="Height" Value="26" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Button.ios-chrome:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#3A3A3C" />
+        </Style>
+        <Style Selector="Button.ios-chrome:disabled">
+            <Setter Property="Opacity" Value="0.35" />
+        </Style>
+        <Style Selector="Path.ios-chrome-icon">
+            <Setter Property="Stretch" Value="Uniform" />
+            <Setter Property="Fill" Value="Transparent" />
+            <Setter Property="Stroke" Value="#C7C7CC" />
+            <Setter Property="StrokeThickness" Value="1.6" />
+            <Setter Property="StrokeLineCap" Value="Round" />
+            <Setter Property="StrokeJoin" Value="Round" />
+        </Style>
     </Window.Styles>
 
     <Grid RowDefinitions="Auto,*">
-        <!-- Top app bar -->
+        <!-- Top app bar (Android viewer only) -->
         <Border x:Name="AppBar"
                 Grid.Row="0"
                 Background="#1A1A1A"
-                Padding="12,8">
+                Padding="12,8"
+                IsVisible="{Binding ShowAndroidViewer}">
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="0"
                             MinWidth="0"
@@ -110,49 +139,68 @@
             </Grid>
         </Border>
 
-        <!-- Video + divider + side toolbar -->
-        <Grid Grid.Row="1" ColumnDefinitions="Auto,1,Auto">
+        <!-- Video + divider + side toolbar (Android viewer only) -->
+        <Grid Grid.Row="1" ColumnDefinitions="Auto,1,Auto"
+              IsVisible="{Binding ShowAndroidViewer}">
             <Border x:Name="VideoColumn"
                     Grid.Column="0"
-                    Width="360"
+                    Width="400"
                     Background="#000000"
                     ClipToBounds="True">
                 <Grid>
                     <StackPanel HorizontalAlignment="Center"
                                 VerticalAlignment="Center"
                                 IsVisible="{Binding ShowVideoPlaceholder}"
-                                Spacing="8">
-                        <TextBlock Text="Waiting for video..."
-                                   FontSize="16"
-                                   Foreground="#666666"
-                                   HorizontalAlignment="Center" />
-                        <TextBlock Text="Stream is negotiating or encoding"
-                                   FontSize="12"
-                                   Foreground="#444444"
-                                   HorizontalAlignment="Center" />
+                                Spacing="12">
+                        <ProgressBar IsIndeterminate="True"
+                                     Width="120"
+                                     Height="4"
+                                     Foreground="#FF5722"
+                                     Background="#333333" />
                     </StackPanel>
                     <Border x:Name="VideoSurface"
                             HorizontalAlignment="Stretch"
                             VerticalAlignment="Stretch"
                             Background="Transparent"
+                            Focusable="True"
                             IsVisible="{Binding HasVideoFrame}">
                         <Image x:Name="VideoImage"
                                Source="{Binding CurrentFrame}"
-                               Stretch="Fill"
-                               RenderOptions.BitmapInterpolationMode="None"
+                               Stretch="Uniform"
+                               RenderOptions.BitmapInterpolationMode="HighQuality"
                                HorizontalAlignment="Stretch"
                                VerticalAlignment="Stretch" />
+                    </Border>
+                    <!-- Capture-stall overlay: shown when capture goes quiet for 500ms+ -->
+                    <Border IsVisible="{Binding IsVideoStalled}"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Bottom"
+                            Margin="0,0,0,24"
+                            Background="#CC1A1A1A"
+                            CornerRadius="14"
+                            Padding="14,7">
+                        <StackPanel Orientation="Horizontal" Spacing="7">
+                            <Ellipse Width="7" Height="7"
+                                     Fill="#FFAA00"
+                                     VerticalAlignment="Center" />
+                            <TextBlock Text="Buffering..."
+                                       Foreground="#FFFFFF"
+                                       FontSize="12"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
                     </Border>
                 </Grid>
             </Border>
 
             <Border Grid.Column="1"
-                    Background="#000000" />
+                    Background="#000000"
+                    IsVisible="{Binding ShowSideToolbar}" />
 
             <Border Grid.Column="2"
                     Width="56"
                     Background="#ECECEC"
-                    BorderThickness="0">
+                    BorderThickness="0"
+                    IsVisible="{Binding ShowSideToolbar}">
                 <StackPanel Margin="0,10,0,10" Spacing="0">
 
                     <Button Classes="emu-tool"
@@ -239,6 +287,161 @@
                     </Button>
                 </StackPanel>
             </Border>
+        </Grid>
+
+        <!-- ── iOS Simulator viewer (iOS only) ─────────────────────────────── -->
+        <!-- Pure presentation: the device frame + chrome are decorative. Touch is
+             computed from IosVideoSurface bounds (the screen rect) with the same
+             letterbox-aware geometry as Android, so the frame never affects the
+             coordinates sent to the simulator. -->
+        <Grid Grid.Row="1"
+              RowDefinitions="Auto,*"
+              Background="#111114"
+              IsVisible="{Binding IsIosViewer}">
+
+            <!-- Simulator-style chrome header -->
+            <Border Grid.Row="0"
+                    Background="#2C2C2E"
+                    BorderBrush="#3A3A3C"
+                    BorderThickness="0,0,0,1"
+                    Height="46"
+                    Padding="12,0">
+                <Grid ColumnDefinitions="Auto,*,Auto" VerticalAlignment="Center">
+                    <!-- Stop stream -->
+                    <Button Grid.Column="0"
+                            Content="Stop"
+                            Command="{Binding StopStreamCommand}"
+                            VerticalAlignment="Center"
+                            Padding="10,4"
+                            MinWidth="52"
+                            FontSize="11"
+                            CornerRadius="4"
+                            Background="#FF5722"
+                            Foreground="#FFFFFF"
+                            FontWeight="SemiBold"
+                            Cursor="Hand" />
+
+                    <!-- Device title -->
+                    <StackPanel Grid.Column="1"
+                                Margin="14,0"
+                                Spacing="0"
+                                VerticalAlignment="Center"
+                                HorizontalAlignment="Center">
+                        <TextBlock Text="{Binding IosDeviceName}"
+                                   FontSize="13"
+                                   FontWeight="SemiBold"
+                                   Foreground="#FFFFFF"
+                                   HorizontalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                        <TextBlock Text="{Binding IosRuntimeLabel}"
+                                   FontSize="10"
+                                   Foreground="#9A9AA0"
+                                   HorizontalAlignment="Center" />
+                    </StackPanel>
+
+                    <!-- Chrome actions: Home / Screenshot / Fullscreen -->
+                    <StackPanel Grid.Column="2"
+                                Orientation="Horizontal"
+                                Spacing="2"
+                                VerticalAlignment="Center">
+                        <Button Classes="ios-chrome"
+                                ToolTip.Tip="Home"
+                                Command="{Binding HomeCommand}">
+                            <Viewbox Width="17" Height="17">
+                                <Canvas Width="24" Height="24">
+                                    <Path Classes="ios-chrome-icon"
+                                          Data="M12,3 L21,11 M3,11 L12,3 M5.5,9.5 L5.5,20 L18.5,20 L18.5,9.5" />
+                                </Canvas>
+                            </Viewbox>
+                        </Button>
+                        <Button Classes="ios-chrome"
+                                ToolTip.Tip="Screenshot"
+                                Command="{Binding ScreenshotCommand}">
+                            <Viewbox Width="17" Height="17">
+                                <Canvas Width="24" Height="24">
+                                    <Path Classes="ios-chrome-icon"
+                                          Data="M4,8 L7,8 L9,5 L15,5 L17,8 L20,8 Q21,8 21,9 L21,18 Q21,19 20,19 L4,19 Q3,19 3,18 L3,9 Q3,8 4,8 Z" />
+                                    <Ellipse Canvas.Left="9" Canvas.Top="10" Width="6" Height="6"
+                                             Stroke="#C7C7CC" StrokeThickness="1.6" Fill="Transparent" />
+                                </Canvas>
+                            </Viewbox>
+                        </Button>
+                        <Button Classes="ios-chrome"
+                                ToolTip.Tip="Toggle fullscreen"
+                                Command="{Binding FullscreenCommand}">
+                            <Viewbox Width="17" Height="17">
+                                <Canvas Width="24" Height="24">
+                                    <Path Classes="ios-chrome-icon"
+                                          Data="M4,9 L4,4 L9,4 M15,4 L20,4 L20,9 M20,15 L20,20 L15,20 M9,20 L4,20 L4,15" />
+                                </Canvas>
+                            </Viewbox>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Device area -->
+            <Grid Grid.Row="1">
+                <!-- Physical device frame (bezel) -->
+                <Border x:Name="IosDeviceFrame"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Margin="20"
+                        Padding="13"
+                        Background="#0A0A0C"
+                        CornerRadius="52"
+                        BorderBrush="#26262A"
+                        BorderThickness="5">
+                    <Grid>
+                        <!-- Screen (touch target). CornerRadius + clip mask the
+                             rectangular framebuffer to iPhone screen corners. -->
+                        <Border x:Name="IosVideoSurface"
+                                Background="#000000"
+                                CornerRadius="40"
+                                ClipToBounds="True"
+                                Focusable="True">
+                            <Grid>
+                                <StackPanel HorizontalAlignment="Center"
+                                            VerticalAlignment="Center"
+                                            IsVisible="{Binding ShowVideoPlaceholder}"
+                                            Spacing="12">
+                                    <ProgressBar IsIndeterminate="True"
+                                                 Width="120"
+                                                 Height="4"
+                                                 Foreground="#FF5722"
+                                                 Background="#333333" />
+                                </StackPanel>
+                                <Image x:Name="IosVideoImage"
+                                       Source="{Binding CurrentFrame}"
+                                       Stretch="Uniform"
+                                       RenderOptions.BitmapInterpolationMode="HighQuality"
+                                       HorizontalAlignment="Stretch"
+                                       VerticalAlignment="Stretch"
+                                       IsVisible="{Binding HasVideoFrame}" />
+                            </Grid>
+                        </Border>
+
+                        <!-- Capture-stall overlay -->
+                        <Border IsVisible="{Binding IsVideoStalled}"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Bottom"
+                                Margin="0,0,0,40"
+                                Background="#CC1A1A1A"
+                                CornerRadius="14"
+                                Padding="14,7">
+                            <StackPanel Orientation="Horizontal" Spacing="7">
+                                <Ellipse Width="7" Height="7"
+                                         Fill="#FFAA00"
+                                         VerticalAlignment="Center" />
+                                <TextBlock Text="Buffering..."
+                                           Foreground="#FFFFFF"
+                                           FontSize="12"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                </Border>
+            </Grid>
         </Grid>
     </Grid>
 </Window>

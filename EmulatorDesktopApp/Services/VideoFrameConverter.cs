@@ -43,9 +43,10 @@ namespace EmulatorDesktopApp.Services
             if (hint.Contains("I420") || hint.Contains("NV12") || hint.Contains("YUV"))
                 return "I420";
 
-            int rowBytes = stride > 0 ? stride : width * 3;
-            if (dataLength >= rowBytes * height && rowBytes == width * 4)
+            int rowBytes = stride > 0 ? stride : width * 4;
+            if (dataLength >= rowBytes * height && rowBytes >= width * 4)
                 return "BGRA32";
+            rowBytes = stride > 0 ? stride : width * 3;
             if (dataLength >= rowBytes * height && rowBytes >= width * 3)
                 return "BGR24";
             if (dataLength == (width * height * 3) / 2)
