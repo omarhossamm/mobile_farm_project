@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using FFmpeg.AutoGen;
 using SIPSorcery.Net;
 using SIPSorceryMedia.Abstractions;
 using SIPSorceryMedia.FFmpeg;
@@ -83,6 +84,7 @@ namespace EmulatorDesktopApp.Services
 
     private static bool _loggingInitialized;
     private static bool _ffmpegInitialized;
+    private static string? _ffmpegLoadDiag;
     private bool _disposed;
         private RTCPeerConnection? _peerConnection;
         private FFmpegVideoEndPoint? _videoEndPoint;
@@ -177,27 +179,122 @@ namespace EmulatorDesktopApp.Services
             }
         }
 
+        /// <summary>
+        /// Locate FFmpeg shared libraries. Search order:
+        ///   1. FFMPEG_LIB_PATH override.
+        ///   2. App output directory (Windows bundled DLLs from FFmpeg.Windows.targets).
+        ///   3. Homebrew paths (macOS).
+        /// </summary>
         private static string? ResolveFfmpegLibPath()
         {
             var fromEnv = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH");
-            if (!string.IsNullOrWhiteSpace(fromEnv) && Directory.Exists(fromEnv))
+            if (DirectoryHasFfmpeg(fromEnv))
                 return fromEnv;
 
-            string[] candidates =
+            var baseDir = AppContext.BaseDirectory;
+            foreach (var path in BundledFfmpegDirs(baseDir))
             {
-                "/opt/homebrew/lib",
-                "/opt/homebrew/opt/ffmpeg/lib",
-                "/usr/local/lib",
-                "/usr/local/opt/ffmpeg/lib"
-            };
-
-            foreach (var path in candidates)
-            {
-                if (Directory.Exists(path) && Directory.GetFiles(path, "libavutil*.dylib").Length > 0)
+                if (DirectoryHasFfmpeg(path))
                     return path;
             }
 
+            if (OperatingSystem.IsMacOS())
+            {
+                string[] homebrew =
+                {
+                    "/opt/homebrew/lib",
+                    "/opt/homebrew/opt/ffmpeg/lib",
+                    "/usr/local/lib",
+                    "/usr/local/opt/ffmpeg/lib"
+                };
+                foreach (var path in homebrew)
+                {
+                    if (DirectoryHasFfmpeg(path))
+                        return path;
+                }
+            }
+
             return null;
+        }
+
+        private static IEnumerable<string> BundledFfmpegDirs(string baseDir)
+        {
+            yield return baseDir;
+            yield return Path.Combine(baseDir, "ffmpeg");
+            string rid = RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+                ? "win-arm64" : "win-x64";
+            yield return Path.Combine(baseDir, "runtimes", rid, "native");
+        }
+
+        private static readonly string[] WindowsRequiredFfmpegDlls =
+        {
+            "avutil-60.dll", "avcodec-62.dll", "avformat-62.dll",
+            "avfilter-11.dll", "avdevice-62.dll", "swresample-6.dll", "swscale-9.dll"
+        };
+
+        private static bool DirectoryHasFfmpeg(string? dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+                return false;
+
+            if (OperatingSystem.IsWindows())
+            {
+                foreach (var name in WindowsRequiredFfmpegDlls)
+                {
+                    if (!File.Exists(Path.Combine(dir, name)))
+                        return false;
+                }
+                return true;
+            }
+
+            string pattern = OperatingSystem.IsMacOS() ? "libavutil*.dylib" : "libavutil*.so*";
+            return Directory.GetFiles(dir, pattern).Length > 0;
+        }
+
+        private static string NormalizeFfmpegRoot(string dir) =>
+            Path.GetFullPath(dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            + Path.DirectorySeparatorChar;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string? lpPathName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibraryEx(string lpLibFileName, IntPtr hFile, uint dwFlags);
+
+        private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+
+        private static void PinWindowsNativeDllSearch(string libPath) =>
+            SetDllDirectory(libPath);
+
+        private static void PreloadWindowsFfmpeg(string libPath)
+        {
+            var loadOrder = new List<string>();
+            string[] prefixes =
+            {
+                "avutil-", "swresample-", "swscale-", "postproc-",
+                "avcodec-", "avformat-", "avfilter-", "avdevice-"
+            };
+            foreach (var prefix in prefixes)
+                loadOrder.AddRange(Directory.GetFiles(libPath, prefix + "*.dll"));
+            foreach (var dll in Directory.GetFiles(libPath, "*.dll"))
+            {
+                if (!loadOrder.Contains(dll, StringComparer.OrdinalIgnoreCase))
+                    loadOrder.Add(dll);
+            }
+
+            var loaded = 0;
+            var failures = new List<string>();
+            foreach (var dll in loadOrder)
+            {
+                if (LoadLibraryEx(dll, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH) == IntPtr.Zero)
+                    failures.Add($"{Path.GetFileName(dll)} (err {Marshal.GetLastWin32Error()})");
+                else
+                    loaded++;
+            }
+
+            _ffmpegLoadDiag = failures.Count == 0
+                ? $"preloaded {loaded} DLL(s) from {libPath}"
+                : $"preloaded {loaded} DLL(s) from {libPath}; failed: {string.Join(", ", failures)}";
         }
 
         private static void EnsureFfmpegInitialized()
@@ -208,9 +305,22 @@ namespace EmulatorDesktopApp.Services
             EnsureLoggingInitialized();
             var libPath = ResolveFfmpegLibPath();
 
-            // Pass _diagLogger so FFmpeg internal warnings (e.g. "concealing N
-            // DC, AC, MV errors in I frame") are intercepted and counted for
-            // the A/B provider comparison instead of being silently discarded.
+            if (OperatingSystem.IsWindows())
+            {
+                if (libPath == null)
+                {
+                    throw new DllNotFoundException(
+                        "Unable to find FFMPEG binaries. Rebuild on Windows (dotnet build) to auto-download " +
+                        "the Gyan codexffmpeg 8.1 DLLs, copy all *.dll from ffmpeg/win-x64/ next to the exe, " +
+                        "or set FFMPEG_LIB_PATH to a folder containing avutil-60.dll and the other FFmpeg 8.x DLLs.");
+                }
+
+                libPath = NormalizeFfmpegRoot(libPath);
+                PinWindowsNativeDllSearch(libPath);
+                PreloadWindowsFfmpeg(libPath);
+                ffmpeg.RootPath = libPath;
+            }
+
             if (libPath != null)
                 FFmpegInit.Initialise(
                     logLevel: FfmpegLogLevelEnum.AV_LOG_WARNING,
@@ -270,6 +380,8 @@ namespace EmulatorDesktopApp.Services
                 EnsureFfmpegInitialized();
                 var ffmpegLib = ResolveFfmpegLibPath() ?? "(system default)";
                 OnLog?.Invoke($"[WebRTC] FFmpeg initialized (lib: {ffmpegLib})");
+                if (!string.IsNullOrEmpty(_ffmpegLoadDiag))
+                    OnLog?.Invoke($"[WebRTC] FFmpeg native libraries {_ffmpegLoadDiag}");
 
                 if (_peerConnection != null)
                     ClosePeer();
