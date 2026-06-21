@@ -90,6 +90,16 @@
   <Target Name="CopyFfmpegNativeToOutput"
           AfterTargets="EnsureNativeFFmpeg"
           BeforeTargets="CoreBuild">
+    <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
+  </Target>
+
+  <Target Name="CopyFfmpegNativeAfterBuild"
+          AfterTargets="Build"
+          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
+    <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
+  </Target>
+
+  <Target Name="_CopyFfmpegNativeToOutputImpl">
     <ItemGroup>
       <_FfmpegNativeDll Include="$(FFmpegDestDir)*.dll" Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
     </ItemGroup>

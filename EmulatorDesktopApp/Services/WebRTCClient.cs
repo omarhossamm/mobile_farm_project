@@ -182,17 +182,21 @@ namespace EmulatorDesktopApp.Services
         /// <summary>
         /// Locate FFmpeg shared libraries. Search order:
         ///   1. FFMPEG_LIB_PATH override.
-        ///   2. App output directory (Windows bundled DLLs from FFmpeg.Windows.targets).
-        ///   3. Homebrew paths (macOS).
+        ///   2. App output directory (bundled DLLs copied by FFmpeg.Windows.targets).
+        ///   3. Project ffmpeg/win-x64 folder (dotnet run without a fresh build).
+        ///   4. winget Gyan FFmpeg (Shared) install, if present.
+        ///   5. Homebrew paths (macOS).
         /// </summary>
         private static string? ResolveFfmpegLibPath()
         {
+            if (OperatingSystem.IsWindows())
+                EnsureWindowsFfmpegBesideExecutable();
+
             var fromEnv = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH");
             if (DirectoryHasFfmpeg(fromEnv))
                 return fromEnv;
 
-            var baseDir = AppContext.BaseDirectory;
-            foreach (var path in BundledFfmpegDirs(baseDir))
+            foreach (var path in BundledFfmpegSearchDirs())
             {
                 if (DirectoryHasFfmpeg(path))
                     return path;
@@ -217,13 +221,83 @@ namespace EmulatorDesktopApp.Services
             return null;
         }
 
-        private static IEnumerable<string> BundledFfmpegDirs(string baseDir)
+        /// <summary>
+        /// Directories to probe for bundled FFmpeg (Windows output + project bundle + winget).
+        /// </summary>
+        private static IEnumerable<string> BundledFfmpegSearchDirs()
         {
+            var baseDir = AppContext.BaseDirectory;
             yield return baseDir;
             yield return Path.Combine(baseDir, "ffmpeg");
+
             string rid = RuntimeInformation.ProcessArchitecture == Architecture.Arm64
                 ? "win-arm64" : "win-x64";
             yield return Path.Combine(baseDir, "runtimes", rid, "native");
+
+            foreach (var path in EnumerateProjectFfmpegBundleDirs())
+                yield return path;
+
+            foreach (var path in EnumerateWingetFfmpegDirs())
+                yield return path;
+        }
+
+        /// <summary>Walk up from the app folder looking for ffmpeg/win-x64 (repo layout).</summary>
+        private static IEnumerable<string> EnumerateProjectFfmpegBundleDirs()
+        {
+            if (!OperatingSystem.IsWindows())
+                yield break;
+
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (var i = 0; i < 6 && dir != null; i++, dir = dir.Parent)
+            {
+                yield return Path.Combine(dir.FullName, "ffmpeg", "win-x64");
+                yield return Path.Combine(dir.FullName, "EmulatorDesktopApp", "ffmpeg", "win-x64");
+            }
+        }
+
+        /// <summary>winget: Gyan.FFmpeg.Shared installs under LocalAppData\Microsoft\WinGet\Packages\...</summary>
+        private static IEnumerable<string> EnumerateWingetFfmpegDirs()
+        {
+            if (!OperatingSystem.IsWindows())
+                yield break;
+
+            var wingetRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "WinGet", "Packages");
+            if (!Directory.Exists(wingetRoot))
+                yield break;
+
+            foreach (var pkg in Directory.EnumerateDirectories(wingetRoot, "Gyan.FFmpeg.Shared*"))
+            {
+                foreach (var bin in Directory.EnumerateDirectories(pkg, "ffmpeg-*-full_build-shared", SearchOption.AllDirectories))
+                {
+                    var binDir = Path.Combine(bin, "bin");
+                    if (Directory.Exists(binDir))
+                        yield return binDir;
+                }
+            }
+        }
+
+        /// <summary>
+        /// If the bundle exists in ffmpeg/win-x64 but not beside the exe, copy it now so
+        /// dotnet run works even when MSBuild copy did not run (e.g. stale build output).
+        /// </summary>
+        private static void EnsureWindowsFfmpegBesideExecutable()
+        {
+            var appDir = NormalizeFfmpegRoot(AppContext.BaseDirectory);
+            if (DirectoryHasFfmpeg(appDir))
+                return;
+
+            foreach (var src in EnumerateProjectFfmpegBundleDirs())
+            {
+                if (!DirectoryHasFfmpeg(src))
+                    continue;
+
+                Directory.CreateDirectory(appDir);
+                foreach (var name in WindowsRequiredFfmpegDlls)
+                    File.Copy(Path.Combine(src, name), Path.Combine(appDir, name), overwrite: true);
+                return;
+            }
         }
 
         private static readonly string[] WindowsRequiredFfmpegDlls =
@@ -268,6 +342,16 @@ namespace EmulatorDesktopApp.Services
 
         private static void PreloadWindowsFfmpeg(string libPath)
         {
+            var avutilPath = Path.Combine(libPath, "avutil-60.dll");
+            if (!File.Exists(avutilPath))
+                throw new FileNotFoundException($"FFmpeg avutil-60.dll not found at {avutilPath}");
+
+            var avutilSize = new FileInfo(avutilPath).Length;
+            if (avutilSize < 100_000)
+                throw new InvalidDataException(
+                    $"FFmpeg avutil-60.dll at {avutilPath} looks invalid ({avutilSize} bytes). " +
+                    "Run 'dotnet build' on Windows to re-download the Gyan codexffmpeg 8.1 bundle.");
+
             var loadOrder = new List<string>();
             string[] prefixes =
             {
@@ -287,14 +371,22 @@ namespace EmulatorDesktopApp.Services
             foreach (var dll in loadOrder)
             {
                 if (LoadLibraryEx(dll, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH) == IntPtr.Zero)
-                    failures.Add($"{Path.GetFileName(dll)} (err {Marshal.GetLastWin32Error()})");
+                    failures.Add($"{Path.GetFileName(dll)} (Win32={Marshal.GetLastWin32Error()})");
                 else
                     loaded++;
             }
 
             _ffmpegLoadDiag = failures.Count == 0
-                ? $"preloaded {loaded} DLL(s) from {libPath}"
+                ? $"preloaded {loaded} DLL(s) from {libPath} ({(Environment.Is64BitProcess ? "64" : "32")}-bit process)"
                 : $"preloaded {loaded} DLL(s) from {libPath}; failed: {string.Join(", ", failures)}";
+
+            if (failures.Any(f => f.StartsWith("avutil-60", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new DllNotFoundException(
+                    $"{_ffmpegLoadDiag}. " +
+                    "Ensure the app is 64-bit (PlatformTarget=x64), install the Microsoft VC++ Redistributable (x64), " +
+                    "and rebuild with 'dotnet build' so all 7 Gyan codexffmpeg 8.1 DLLs are copied next to the exe.");
+            }
         }
 
         private static void EnsureFfmpegInitialized()
