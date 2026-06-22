@@ -40,6 +40,15 @@ class CoreSimIOSurfaceStream extends EventEmitter {
   constructor(udid, opts = {}) {
     super();
     this.providerId = 'ios-coresim-iosurface';
+
+    // The helper emits exactly one COMPLETE Annex-B access unit per `data`
+    // event (length-prefixed framing parsed in _onStdout), so the H.264
+    // processor can drain on real AU boundaries instead of re-deriving them
+    // with the idle-gap heuristic. This eliminates the partialPFrameRetained /
+    // idlePFrameDrain churn and the partial-frame mis-segmentation that showed
+    // up as tearing/overlap on iOS. See StreamManager's frameDelimited wiring.
+    this.frameDelimited = true;
+
     this._udid = udid;
     this._deviceTypeIdentifier = opts.deviceTypeIdentifier || '';
     this._fps = opts.fps || streamConfig.iosFps;

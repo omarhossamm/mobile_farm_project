@@ -812,7 +812,16 @@ class StreamManager {
     const stats = { bytesIn: 0, nalsParsed: 0, framesEmitted: 0 };
     const state = createStreamProcessorState({ format: 'annexb' });
     const keyframesOnly = options.keyframesOnly ?? streamConfig.keyframesOnly;
-    const frameDelimited = captureProviderId === 'scrcpy-capture';
+    // A capture is "frame-delimited" when each emitted chunk is exactly one
+    // complete H.264 access unit, letting the processor drain on real AU
+    // boundaries (drainAnnexBAtFrameBoundary) instead of guessing them via the
+    // idle-gap heuristic. Prefer the capture stream's own capability flag;
+    // fall back to the known provider list. NOTE: ios-idb-transcode emits raw
+    // ffmpeg pipe chunks on arbitrary boundaries and must stay heuristic-based.
+    const frameDelimited = typeof capture?.frameDelimited === 'boolean'
+      ? capture.frameDelimited
+      : (captureProviderId === 'scrcpy-capture' ||
+         captureProviderId === 'ios-coresim-iosurface');
     const ctx = {
       emitter,
       packetizer,

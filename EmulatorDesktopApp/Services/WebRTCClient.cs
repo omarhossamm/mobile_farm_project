@@ -88,6 +88,12 @@ namespace EmulatorDesktopApp.Services
     private bool _disposed;
         private RTCPeerConnection? _peerConnection;
         private FFmpegVideoEndPoint? _videoEndPoint;
+
+        // Serializes native FFmpeg decode (GotVideoFrame on the RTP receive
+        // thread) against decoder disposal (ClosePeer on the stop/UI thread).
+        // Without it, destroying the session while a frame is mid-decode frees
+        // the native AVCodecContext under the decode call → SIGSEGV (exit 139).
+        private readonly object _decodeLock = new object();
         private string? _currentSessionId;
         private readonly List<RTCIceCandidateInit> _pendingCandidates = new();
         private bool _hasRemoteDescription;
@@ -1004,21 +1010,25 @@ namespace EmulatorDesktopApp.Services
                     continue;
                 }
 
-                var endpoint = _videoEndPoint;
-                if (endpoint == null)
-                    return;
-
-                if (_activeVideoFormat == null || _activeVideoFormat.Value.FormatID != format.FormatID)
-                    ApplyDecoderFormat(format, "frame");
-
-                try
+                // Hold _decodeLock across the native decode so ClosePeer cannot
+                // dispose the FFmpeg endpoint mid-frame (use-after-free → SIGSEGV).
+                lock (_decodeLock)
                 {
-                    endpoint.GotVideoFrame(remoteEndPoint, timestamp, feed, format);
-                }
-                catch (Exception ex)
-                {
-                    if (n <= 5 || n % 60 == 0)
-                        OnLog?.Invoke($"[WebRTC] GotVideoFrame error: {ex.Message}");
+                    if (_videoEndPoint == null)
+                        return;
+
+                    if (_activeVideoFormat == null || _activeVideoFormat.Value.FormatID != format.FormatID)
+                        ApplyDecoderFormat(format, "frame");
+
+                    try
+                    {
+                        _videoEndPoint.GotVideoFrame(remoteEndPoint, timestamp, feed, format);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (n <= 5 || n % 60 == 0)
+                            OnLog?.Invoke($"[WebRTC] GotVideoFrame error: {ex.Message}");
+                    }
                 }
             }
         }
@@ -1894,21 +1904,14 @@ namespace EmulatorDesktopApp.Services
             _firstDecodedFrameTicks = 0;
             _statsSessionStartTicks = 0;
 
-            if (_videoEndPoint != null)
-            {
-                try
-                {
-                    _videoEndPoint.OnVideoSinkDecodedSampleFaster -= HandleDecodedVideoFrame;
-                    _videoEndPoint.Dispose();
-                }
-                catch { }
-                _videoEndPoint = null;
-            }
-
-            _controlChannel = null;
-
+            // Order matters: stop inbound RTP delivery BEFORE disposing the FFmpeg
+            // decoder. Otherwise a packet already in flight on the RTP receive
+            // thread can call GotVideoFrame() on a freed native decoder context
+            // and segfault the process (observed as exit code 139 on destroy).
             if (_peerConnection != null)
             {
+                try { _peerConnection.OnRtpPacketReceivedByIndex -= HandleIncomingRtpPacket; }
+                catch { }
                 if (_onIceCandidateHandler != null)
                 {
                     try { _peerConnection.onicecandidate -= _onIceCandidateHandler; }
@@ -1919,6 +1922,24 @@ namespace EmulatorDesktopApp.Services
                 catch { }
                 _peerConnection = null;
             }
+
+            // Dispose the decoder under the same lock the decode path holds, so a
+            // concurrent GotVideoFrame() finishes before the native context is freed.
+            lock (_decodeLock)
+            {
+                if (_videoEndPoint != null)
+                {
+                    try
+                    {
+                        _videoEndPoint.OnVideoSinkDecodedSampleFaster -= HandleDecodedVideoFrame;
+                        _videoEndPoint.Dispose();
+                    }
+                    catch { }
+                    _videoEndPoint = null;
+                }
+            }
+
+            _controlChannel = null;
 
             CancelMediaWatch();
 

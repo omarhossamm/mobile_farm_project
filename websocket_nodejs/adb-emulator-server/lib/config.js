@@ -57,11 +57,33 @@ const streamConfig = {
   recordBitrate: parseIntEnv('STREAM_RECORD_BITRATE', 8_000_000),
 
   // ── Android-specific capture tuning ─────────────────────────────────────
-  // scrcpy MediaCodec: max_size limits the long edge; bitrate drives blockiness.
-  androidMaxSize:  parseIntEnv('ANDROID_MAX_SIZE', 1080),
+  // scrcpy MediaCodec: max_size limits the LONG edge; bitrate drives blockiness.
+  //
+  // SHARPNESS / "pixel quality"
+  // ───────────────────────────
+  // max_size scales so the device's LONGER dimension == max_size. A portrait
+  // 1080×2400 panel at max_size=1080 is therefore squashed to ~486×1080 before
+  // encoding — that downscale (not the codec) is the dominant cause of soft
+  // text and pixelation. Raising it to 1600 captures ~720×1600 (≈1.5× linear
+  // resolution, much crisper) while staying under the H.264 Level 4.1 frame
+  // budget (~2.0 MP): 720×1600 ≈ 1.15 MP, safe. Going full-native (1080×2400 ≈
+  // 2.6 MP) would exceed L4.1 and force the encoder to bump level or fail, so
+  // we cap here. Lower via ANDROID_MAX_SIZE if the emulator host can't sustain
+  // the higher pixel rate (you'll trade fps for resolution).
+  androidMaxSize:  parseIntEnv('ANDROID_MAX_SIZE', 1600),
   androidWidth:    parseIntEnv('ANDROID_STREAM_WIDTH',   1080),
   androidHeight:   parseIntEnv('ANDROID_STREAM_HEIGHT',  2400),
-  androidBitrate:  parseIntEnv('ANDROID_STREAM_BITRATE', 6_000_000),
+
+  // COLOR / BLOCKINESS
+  // ──────────────────
+  // Higher bitrate = fewer quantization artifacts = cleaner gradients (less
+  // colour banding) and sharper edges. 6 Mbps was tuned for the old ~486-wide
+  // capture; at the higher 1600 max_size it would starve the encoder and
+  // reintroduce blocking, so we raise to 8 Mbps to match the extra pixels.
+  // Because the WebRTC path has no retransmission, larger frames are slightly
+  // more loss-prone — keep ≤10 Mbps on Wi-Fi. Override with
+  // ANDROID_STREAM_BITRATE.
+  androidBitrate:  parseIntEnv('ANDROID_STREAM_BITRATE', 8_000_000),
   androidFps:      parseIntEnv('ANDROID_STREAM_FPS', 30),
 
   /**
