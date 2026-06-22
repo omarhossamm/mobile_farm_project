@@ -13,15 +13,6 @@
     <FFmpegAutoDownload Condition="'$(FFmpegAutoDownload)' == ''">true</FFmpegAutoDownload>
   </PropertyGroup>
 
-  <ItemGroup>
-    <Content Include="ffmpeg\win-x64\*.dll" Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-      <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-      <Visible>false</Visible>
-    </Content>
-  </ItemGroup>
-
   <Target Name="EnsureNativeFFmpeg"
           BeforeTargets="BeforeBuild;PrepareForBuild;PrepareForPublish"
           Condition="'$(FFmpegAutoDownload)' == 'true'">
@@ -88,15 +79,27 @@
              Text="FFmpeg DLLs missing in $(FFmpegDestDir). Run with network access or set FFMPEG_LIB_PATH." />
   </Target>
 
+  <!-- Copy via MSBuild Copy task only (no Content/CopyToOutputDirectory — avoids MSB3024 on subfolders). -->
   <Target Name="CopyFfmpegNativeToOutput"
           AfterTargets="EnsureNativeFFmpeg"
-          BeforeTargets="CoreBuild">
+          BeforeTargets="CoreBuild;CopyFilesToOutputDirectory"
+          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
     <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
   </Target>
 
   <Target Name="CopyFfmpegNativeAfterBuild"
           AfterTargets="Build"
           Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
+    <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
+  </Target>
+
+  <Target Name="CopyFfmpegNativeBeforePublish"
+          AfterTargets="EnsureNativeFFmpeg"
+          BeforeTargets="ComputeFilesToPublish"
+          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
+    <PropertyGroup>
+      <FFmpegOutDir>$(PublishDir)ffmpeg\win-x64\</FFmpegOutDir>
+    </PropertyGroup>
     <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
   </Target>
 
@@ -119,63 +122,11 @@
       <_StaleFfmpegOutRootDll Include="$(OutDir)postproc-*.dll" />
     </ItemGroup>
     <Delete Files="@(_StaleFfmpegOutRootDll)" Condition="'@(_StaleFfmpegOutRootDll)' != ''" />
-    <MakeDir Directories="$(FFmpegOutDir)" Condition="!Exists('$(FFmpegOutDir)')" />
+    <MakeDir Directories="$(OutDir);$(FFmpegOutDir)" />
     <Copy SourceFiles="@(_FfmpegNativeDll)"
           DestinationFolder="$(FFmpegOutDir)"
           SkipUnchangedFiles="false"
-          OverwriteReadOnlyFiles="true"
-          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
-    <Message Importance="high"
-             Text="[FFmpeg] Copied 7 DLL(s) to $(FFmpegOutDir)"
-             Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
-  </Target>
-
-  <Target Name="IncludeProvisionedFfmpegDlls"
-          AfterTargets="CopyFfmpegNativeToOutput"
-          BeforeTargets="AssignTargetPaths">
-    <ItemGroup Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
-      <Content Include="$(FFmpegDestDir)avutil-60.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)swresample-6.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)swscale-9.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)avcodec-62.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)avformat-62.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)avfilter-11.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-      <Content Include="$(FFmpegDestDir)avdevice-62.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
-        <Visible>false</Visible>
-      </Content>
-    </ItemGroup>
+          OverwriteReadOnlyFiles="true" />
+    <Message Importance="high" Text="[FFmpeg] Copied 7 DLL(s) to $(FFmpegOutDir)" />
   </Target>
 </Project>
