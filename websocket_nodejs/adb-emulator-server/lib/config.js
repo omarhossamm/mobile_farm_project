@@ -61,8 +61,30 @@ const streamConfig = {
   androidMaxSize:  parseIntEnv('ANDROID_MAX_SIZE', 1080),
   androidWidth:    parseIntEnv('ANDROID_STREAM_WIDTH',   1080),
   androidHeight:   parseIntEnv('ANDROID_STREAM_HEIGHT',  2400),
-  androidBitrate:  parseIntEnv('ANDROID_STREAM_BITRATE', 8_000_000),
+  androidBitrate:  parseIntEnv('ANDROID_STREAM_BITRATE', 6_000_000),
   androidFps:      parseIntEnv('ANDROID_STREAM_FPS', 30),
+
+  /**
+   * MediaCodec keyframe (IDR) interval in seconds for scrcpy capture.
+   *
+   * WHY THIS MATTERS — "frame overlapping" / ghosting fix
+   * ────────────────────────────────────────────────────
+   * The WebRTC video path is H.264 over UDP with NO retransmission guarantee.
+   * scrcpy's encoder defaults to a ~10 s keyframe interval and, on a static
+   * screen, may emit only ONE IDR for the whole session. When a single RTP
+   * packet is lost, every subsequent P-frame predicts from a now-wrong
+   * reference, so updated regions paint over stale ones (visible "overlapping"
+   * / smearing) and never self-correct until the next IDR — which could be
+   * 30–60 s away.
+   *
+   * Forcing a short IDR cadence (1 s) bounds that corruption window to ~1 s:
+   * the picture fully refreshes every second regardless of loss. Passed to the
+   * encoder via scrcpy `video_codec_options=i-frame-interval:int=N`.
+   *
+   * Set to 0 to omit the option entirely (use the encoder default). Raise to
+   * 2–3 to reduce keyframe bandwidth overhead at the cost of slower recovery.
+   */
+  androidKeyframeSec: parseIntEnv('ANDROID_KEYFRAME_SEC', 1),
 
   // ── iOS-specific capture tuning ─────────────────────────────────────────
   // CoreSimulator capture is native-resolution (no max_size); width/height are

@@ -53,6 +53,12 @@
  * SCRCPY_MAX_SIZE       Encoder max dimension (default: 1080, from ANDROID_MAX_SIZE).
  * SCRCPY_BITRATE        Video bitrate bps (default: 8M, from ANDROID_STREAM_BITRATE).
  * SCRCPY_MAX_FPS        Encoder FPS cap (default: 30).
+ * SCRCPY_KEYFRAME_SEC   Forced keyframe (IDR) interval in seconds
+ *                       (default: 1, from ANDROID_KEYFRAME_SEC). Passed to the
+ *                       encoder as video_codec_options=i-frame-interval. A short
+ *                       cadence bounds H.264 reference drift ("frame
+ *                       overlapping") from packet loss to ~N seconds. Set 0 to
+ *                       use the encoder default (~10 s).
  * SCRCPY_STALL_MS       No-DATA stall timeout ms (default: 30000). Any byte
  *                       (CONFIG keepalive or VCL) resets it. This is a
  *                       "socket truly dead" safety net only — a static screen
@@ -116,7 +122,20 @@ function resolveCaptureTuning(opts = {}) {
     || streamConfig.androidFps
     || streamConfig.fps
     || 30;
-  return { maxSize, bitrate, maxFps };
+  // Keyframe (IDR) interval in seconds. 0 → omit (encoder default). A short
+  // cadence bounds H.264 reference-drift ("frame overlapping") to ~N seconds
+  // on a lossy link. parseInt falls back through env → config → 1s default,
+  // but must preserve an explicit 0 (meaning "disable"), so check for finite.
+  let keyframeSec = opts.keyframeSec;
+  if (!Number.isFinite(keyframeSec)) {
+    const envKf = parseInt(process.env.SCRCPY_KEYFRAME_SEC, 10);
+    keyframeSec = Number.isFinite(envKf)
+      ? envKf
+      : (Number.isFinite(streamConfig.androidKeyframeSec)
+          ? streamConfig.androidKeyframeSec
+          : 1);
+  }
+  return { maxSize, bitrate, maxFps, keyframeSec };
 }
 
 // Safety net for a genuinely dead socket only. A static Android screen produces
@@ -193,6 +212,7 @@ class ScrcpyCaptureStream extends EventEmitter {
     this._maxSize = tuning.maxSize;
     this._bitrate = tuning.bitrate;
     this._maxFps = tuning.maxFps;
+    this._keyframeSec = tuning.keyframeSec;
 
     this._stats = {
       bytes: 0, chunks: 0, frames: 0,
@@ -357,12 +377,22 @@ class ScrcpyCaptureStream extends EventEmitter {
     const majorVersion = parseInt(SCRCPY_VERSION, 10);
     const isV2 = majorVersion >= 2;
 
+    // Force a short keyframe (IDR) cadence so H.264 reference drift from packet
+    // loss ("frame overlapping" / ghosting) self-corrects within _keyframeSec.
+    // scrcpy applies these to the MediaCodec MediaFormat, overriding the encoder
+    // default (~10 s). Omitted when disabled (0) so we fall back to the default.
+    // v1.x scrcpy used `codec_options=`; v2.x renamed it to `video_codec_options=`.
+    const codecOptions = this._keyframeSec > 0
+      ? `i-frame-interval:int=${this._keyframeSec}`
+      : null;
+
     const serverArgs = isV2
       ? [
           'video_codec=h264',
           `max_size=${this._maxSize}`,
           `video_bit_rate=${this._bitrate}`,
           `max_fps=${this._maxFps}`,
+          ...(codecOptions ? [`video_codec_options=${codecOptions}`] : []),
           'tunnel_forward=true',
           'send_frame_meta=true',
           'control=false',
@@ -373,6 +403,7 @@ class ScrcpyCaptureStream extends EventEmitter {
           `max_size=${this._maxSize}`,
           `bit_rate=${this._bitrate}`,
           `max_fps=${this._maxFps}`,
+          ...(codecOptions ? [`codec_options=${codecOptions}`] : []),
           'tunnel_forward=true',
           'send_frame_meta=true',
           'control=false',
@@ -398,7 +429,9 @@ class ScrcpyCaptureStream extends EventEmitter {
       argFormat:     isV2 ? 'v2 (video_bit_rate / audio=false)' : 'v1 (bit_rate)',
       maxSize:       this._maxSize,
       bitrate:       this._bitrate,
-      maxFps:        this._maxFps
+      maxFps:        this._maxFps,
+      keyframeSec:   this._keyframeSec > 0 ? this._keyframeSec : 'encoder-default',
+      codecOptions:  codecOptions || 'none'
     });
 
     this._shellProc = spawn(this._adb, args, { stdio: ['ignore', 'ignore', 'pipe'] });

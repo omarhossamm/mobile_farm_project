@@ -778,8 +778,22 @@ function flushAccessUnit(ctx) {
     const now = Date.now();
     const dupMs = parseInt(process.env.STREAM_IDR_DEDUP_MS, 10) || 2500;
     const isSceneIdr = idrBytes >= DEFAULT_MIN_IDR_BYTES;
-    // First session keyframe is always large; do not scene_cut (would reset decoder before first picture).
-    sceneCut = isSceneIdr && state.framesOut > 0;
+
+    // A scene_cut tells the client to drop frames buffered before a genuine
+    // discontinuity (rotation / app switch). The old heuristic — "any IDR
+    // larger than 8 KB" — misfires badly once we force a short keyframe
+    // cadence (i-frame-interval): during video EVERY periodic IDR is large, so
+    // the client flushed its render slot on every keyframe (~1×/sec), causing
+    // visible stutter. A real discontinuity changes the encoder's SPS
+    // (resolution/orientation), whereas routine forced keyframes re-send the
+    // identical SPS. Gate scene_cut on an actual SPS change so periodic
+    // keyframes never churn the renderer.
+    const spsKey = state.sps ? state.sps.toString('latin1') : '';
+    const spsChanged = spsKey !== '' && state.lastSceneSpsKey !== undefined &&
+      spsKey !== state.lastSceneSpsKey;
+    sceneCut = spsChanged && state.framesOut > 0;
+    state.lastSceneSpsKey = spsKey;
+
     if (!isSceneIdr && state.lastKeyframeEmitAt && now - state.lastKeyframeEmitAt < dupMs) return;
     state.lastKeyframeEmitAt = now;
     state.gotFirstKeyframe = true;

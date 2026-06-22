@@ -217,6 +217,38 @@ async function routeControl(sessionId, event) {
 }
 
 /**
+ * Resolve the concrete device id that a create_session request would reserve.
+ *
+ * Used by the per-device reservation guard. A device may only be claimed by one
+ * live session at a time, so we need a stable key to look up the current owner:
+ *   • iOS simulator UDID  → the UDID itself.
+ *   • Android device_id   (emulator-XXXX / host:port) → the id itself.
+ *   • AVD name            → the device_id of that AVD *only if it is already
+ *                           running* (otherwise there is nothing to reserve yet;
+ *                           a fresh emulator will be started for this session).
+ *
+ * @param {string} device
+ * @returns {Promise<string|null>} reservation key, or null when not yet running.
+ */
+async function resolveRequestedDeviceId(device) {
+  if (!device) return null;
+  if (isIosUdid(device)) return device;
+  if (device.startsWith('emulator-') || device.includes(':')) return device;
+
+  // AVD name — only a conflict when that AVD is already booted under a device id.
+  try {
+    const catalog = await buildDeviceCatalog();
+    const running = catalog.devices.find(
+      (d) => d.avd_name === device && d.status === 'online' && d.device_id
+    );
+    return running ? running.device_id : null;
+  } catch (err) {
+    logger.warn('resolveRequestedDeviceId failed', { device, error: err.message });
+    return null;
+  }
+}
+
+/**
  * Stop stream and release the device bound to the session.
  */
 async function releaseSessionDevice(session, { killEmulator = KILL_EMULATOR_ON_DISCONNECT } = {}) {
@@ -298,14 +330,42 @@ const messageHandlers = {
       return;
     }
 
-    const removed = await sessionManager.destroyAllOtherSessions(session.id, {
-      killEmulator: KILL_EMULATOR_ON_DISCONNECT
-    });
-    if (removed > 0) {
-      logger.info('Destroyed previous sessions before create_session', {
-        sessionId: session.id,
-        removed
-      });
+    // ── Per-device reservation guard ──────────────────────────────────────
+    // A device may be actively used by only ONE live session at a time. If the
+    // requested device is already held by another *connected* session, reject
+    // this request instead of stealing it. (Previously create_session destroyed
+    // every other session, silently kicking the other user off their device —
+    // they received "Session closed because a new session was created".)
+    const reservedDeviceId = await resolveRequestedDeviceId(device);
+    if (reservedDeviceId) {
+      const owner = sessionManager.getSessionByDevice(reservedDeviceId);
+      if (owner && owner.id !== session.id) {
+        const ownerAlive = owner.ws && owner.ws.readyState === owner.ws.OPEN;
+        if (ownerAlive) {
+          logger.warn('Rejected session — device reserved by another user', {
+            sessionId: session.id,
+            requestedDevice: device,
+            deviceId: reservedDeviceId,
+            ownerSessionId: owner.id
+          });
+          session.sendError(
+            'session_created',
+            `Device ${device} is already in use by another user. ` +
+            `Please choose a different device or try again once it is released.`,
+            payload.requestId
+          );
+          return;
+        }
+
+        // The owning socket is already closed/closing — reclaim the device for
+        // this new session so a crashed client never permanently locks a device.
+        logger.info('Reclaiming device from disconnected session', {
+          sessionId: session.id,
+          deviceId: reservedDeviceId,
+          staleOwnerSessionId: owner.id
+        });
+        await sessionManager.removeSession(owner.id, { killEmulator: false });
+      }
     }
 
     if (session.deviceId) {
@@ -395,10 +455,16 @@ const messageHandlers = {
         return;
       }
       
-      // Check if device is already bound to another session
+      // Defensive re-check (the reservation guard above already handles this for
+      // connected owners; this catches any race between the two points).
       const existingSession = sessionManager.getSessionByDevice(device);
       if (existingSession && existingSession.id !== session.id) {
-        session.sendError('session_created', `Device ${device} is already bound to another session`, payload.requestId);
+        session.sendError(
+          'session_created',
+          `Device ${device} is already in use by another user. ` +
+          `Please choose a different device or try again once it is released.`,
+          payload.requestId
+        );
         return;
       }
       

@@ -125,8 +125,14 @@ namespace EmulatorDesktopApp.Streaming
             if (_target?.IsShuttingDown == true)
                 return;
 
+            // Drop the not-yet-converted decoded frame queued before the cut so we
+            // don't paint a pre-discontinuity image. Do NOT blank
+            // _pendingFrontBitmap: clearing it left the screen black until the next
+            // frame was converted, producing a visible flash on every scene cut.
+            // Keeping the last good frame on screen until the post-cut frame is
+            // ready is seamless, and the server now only signals scene_cut on a
+            // genuine discontinuity (SPS/resolution change), not routine keyframes.
             _slot.Clear();
-            _pendingFrontBitmap = null;
             Interlocked.Increment(ref _latestGenForUi);
             _frameSignal.Set();
         }
