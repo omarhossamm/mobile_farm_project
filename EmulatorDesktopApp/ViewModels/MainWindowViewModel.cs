@@ -90,6 +90,7 @@ namespace EmulatorDesktopApp.ViewModels
                     return;
                 _mirror.Render.OnSceneCut();
             };
+            _mirror.WebRtc.OnStreamRecoveryNeeded += HandleStreamRecoveryNeeded;
 
             // Initialize device collection
             Devices = new ObservableCollection<DeviceOption>();
@@ -721,6 +722,41 @@ namespace EmulatorDesktopApp.ViewModels
 
         /// <summary>Called from the stream window Stop button.</summary>
         public Task StopStreamFromStreamWindowAsync() => ExecuteStopStreamAsync();
+
+        private int _streamRecoveryInFlight;
+
+        /// <summary>
+        /// Invoked by the WebRTC freeze watchdog when the media path is stuck (user
+        /// input produced no video). Rebuilds the WebRTC transport by restarting the
+        /// stream on the same session. Guarded so overlapping recoveries and
+        /// recoveries during teardown are ignored; the watchdog's own cooldown
+        /// prevents rapid re-fire.
+        /// </summary>
+        private void HandleStreamRecoveryNeeded()
+        {
+            if (Interlocked.CompareExchange(ref _streamRecoveryInFlight, 1, 0) != 0)
+                return;
+
+            Dispatcher.UIThread.Post(async () =>
+            {
+                try
+                {
+                    if (_isStoppingStream || !IsStreaming || !IsConnected)
+                        return;
+
+                    AppendLog("[STREAM] Auto-recovering frozen stream (rebuilding WebRTC transport)...");
+                    await ExecuteStartStreamAsync();
+                }
+                catch (Exception ex)
+                {
+                    AppendLog($"[ERROR] Stream auto-recovery failed: {ex.Message}");
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _streamRecoveryInFlight, 0);
+                }
+            });
+        }
 
         #endregion
 

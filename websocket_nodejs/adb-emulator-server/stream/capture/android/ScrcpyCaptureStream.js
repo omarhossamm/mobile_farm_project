@@ -53,8 +53,14 @@
  * SCRCPY_MAX_SIZE       Encoder max dimension (default: 1080, from ANDROID_MAX_SIZE).
  * SCRCPY_BITRATE        Video bitrate bps (default: 8M, from ANDROID_STREAM_BITRATE).
  * SCRCPY_MAX_FPS        Encoder FPS cap (default: 30).
- * SCRCPY_STALL_MS       No-data stall timeout ms (default: 45000).
- * SCRCPY_MAX_STALL_RECOVERIES  Reconnect attempts before fatal (default: 3).
+ * SCRCPY_STALL_MS       No-DATA stall timeout ms (default: 30000). Any byte
+ *                       (CONFIG keepalive or VCL) resets it. This is a
+ *                       "socket truly dead" safety net only — a static screen
+ *                       legitimately produces no VCL frames and must NOT be
+ *                       treated as a stall (that caused a reconnect loop).
+ *                       Interaction-without-frame recovery is driven by
+ *                       StreamManager via requestRecovery(), not this timer.
+ * SCRCPY_MAX_STALL_RECOVERIES  Reconnect attempts before fatal (default: 10).
  * SCRCPY_CONNECT_TIMEOUT_MS  Socket connect attempt timeout (default: 10000).
  *
  * @module stream/capture/android/ScrcpyCaptureStream
@@ -113,10 +119,12 @@ function resolveCaptureTuning(opts = {}) {
   return { maxSize, bitrate, maxFps };
 }
 
-// Emulators stop emitting H.264 when the screen is static or the farm client is
-// backgrounded.  45 s before reconnect; fatal only after MAX_STALL_RECOVERIES.
-const STALL_MS = parseInt(process.env.SCRCPY_STALL_MS, 10) || 45_000;
-const MAX_STALL_RECOVERIES = parseInt(process.env.SCRCPY_MAX_STALL_RECOVERIES, 10) || 3;
+// Safety net for a genuinely dead socket only. A static Android screen produces
+// no VCL frames by design (MediaCodec emits on change), so the watchdog must be
+// DATA-based and generous — any byte resets it. Reconnecting on mere video idle
+// tears down a healthy capture and produces a reconnect loop on idle screens.
+const STALL_MS = parseInt(process.env.SCRCPY_STALL_MS, 10) || 30_000;
+const MAX_STALL_RECOVERIES = parseInt(process.env.SCRCPY_MAX_STALL_RECOVERIES, 10) || 10;
 
 // Per-process port allocator: each active ScrcpyCaptureStream gets a unique port
 // from a pool so concurrent sessions on different devices don't collide.
@@ -167,6 +175,7 @@ class ScrcpyCaptureStream extends EventEmitter {
     this._started   = false;
     this._startedAt = 0;
     this._stallTimer = null;
+    this._lastVclAt  = 0;
 
     // Frame parser state machine
     this._parseState = 'DEVICE_INFO';  // → 'FRAME_HEADER' → 'FRAME_DATA'
@@ -200,6 +209,7 @@ class ScrcpyCaptureStream extends EventEmitter {
     if (this._started) return;
     this._started  = true;
     this._startedAt = Date.now();
+    this._lastVclAt = this._startedAt;
 
     // Validate the jar.
     if (!fs.existsSync(SERVER_JAR_PATH)) {
@@ -402,10 +412,11 @@ class ScrcpyCaptureStream extends EventEmitter {
 
     this._shellProc.on('close', (code) => {
       logger.info('scrcpy server shell exited', { serial: this._serial, code });
-      if (this._recovering) return;
-      if (!this._stopped && !this._socket) {
-        this._reportEnd('server_exited', `scrcpy server shell exited (code=${code})`);
-      }
+      if (this._recovering || this._stopped) return;
+      this._recoverFromStall().catch((err) => {
+        logger.error('scrcpy recovery after shell exit failed', { serial: this._serial, error: err.message });
+        this._fatalEnd('server_exited', `scrcpy server shell exited (code=${code})`);
+      });
     });
   }
 
@@ -517,6 +528,7 @@ class ScrcpyCaptureStream extends EventEmitter {
     });
 
     logger.info('scrcpy socket connected', { serial: this._serial, port: this._port });
+    this._lastVclAt = Date.now();
     this._armStall();
   }
 
@@ -594,6 +606,10 @@ class ScrcpyCaptureStream extends EventEmitter {
     if (isConfig)   this._stats.configFrames++;
     if (isKeyframe) this._stats.keyFrames++;
 
+    // Any byte from the socket — including CONFIG keepalives — proves the
+    // capture process is alive, so it resets the "socket dead" watchdog.
+    // _lastVclAt tracks real video separately for telemetry / input-stall logic.
+    if (!isConfig) this._lastVclAt = Date.now();
     this._resetStall();
 
     // Emit the raw H.264 Annex-B bytes; streamProcessor.js handles SPS/PPS
@@ -604,13 +620,28 @@ class ScrcpyCaptureStream extends EventEmitter {
 
   // ── Stall watchdog ────────────────────────────────────────────────────────
 
+  /**
+   * On-demand recovery hook for StreamManager. Used when the user interacted
+   * (input injected) but no new video frame followed within the grace window —
+   * i.e. the encoder is genuinely stuck. NOT used for plain video idle, which
+   * is normal for a static screen.
+   */
+  requestRecovery(reason = 'requested') {
+    if (this._stopped || this._recovering) return Promise.resolve();
+    logger.info('scrcpy recovery requested', { serial: this._serial, reason });
+    this._clearStall();
+    return this._recoverFromStall();
+  }
+
   _armStall() {
     this._clearStall();
     this._stallTimer = setTimeout(() => {
-      if (this._stopped) return;
+      if (this._stopped || this._recovering) return;
+      // Data-based: any byte resets via _resetStall, so reaching here means the
+      // socket delivered nothing at all for STALL_MS — the process is dead.
       this._recoverFromStall().catch((err) => {
         logger.error('scrcpy stall recovery threw', { serial: this._serial, error: err.message });
-        this._fatalEnd('stall_no_data', 'No H.264 data received within timeout');
+        this._fatalEnd('stall_no_data', 'No data from scrcpy socket within timeout');
       });
     }, STALL_MS);
     if (this._stallTimer.unref) this._stallTimer.unref();
@@ -655,6 +686,7 @@ class ScrcpyCaptureStream extends EventEmitter {
       await this._forwardPort();
       this._startServer();
       await this._connectSocket();
+      this._lastVclAt = Date.now();
       this.emit('recovered', { attempt: this._stats.stallRecoveries, reason: 'stall_no_data' });
     } finally {
       this._recovering = false;
@@ -682,8 +714,11 @@ class ScrcpyCaptureStream extends EventEmitter {
 
   _onSocketClose(reason) {
     if (this._stopped || this._recovering) return;
-    logger.warn('scrcpy socket closed unexpectedly', { serial: this._serial, reason });
-    this._fatalEnd(reason, `scrcpy socket closed (${reason})`);
+    logger.warn('scrcpy socket closed — attempting recovery', { serial: this._serial, reason });
+    this._recoverFromStall().catch((err) => {
+      logger.error('scrcpy recovery after socket close failed', { serial: this._serial, error: err.message });
+      this._fatalEnd(reason, `scrcpy socket closed (${reason})`);
+    });
   }
 
   /**

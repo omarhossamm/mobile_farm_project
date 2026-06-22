@@ -65,6 +65,10 @@ namespace EmulatorDesktopApp.Services
 
         private Task SendControlAsync(object controlEvent)
         {
+            // Mark input intent so the freeze watchdog can correlate user actions
+            // with subsequent video updates (recover only when input yields no frame).
+            _webrtc?.NotifyInputSent();
+
             if (_webrtc?.TrySendControlViaDataChannel(controlEvent) == true)
                 return Task.CompletedTask;
 

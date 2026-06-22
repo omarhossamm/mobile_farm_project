@@ -204,6 +204,11 @@ async function createIosSession(session, udid, options, payload) {
 
 /** Route control to PlatformHost providers with legacy capture fallback. */
 async function routeControl(sessionId, event) {
+  // Tell the stream pipeline an input occurred so its watchdog can tell a
+  // genuinely stuck encoder (interaction but no frame) from a normal static
+  // screen. Best-effort — never let this break control routing.
+  try { streamManager.notifyInput(sessionId); } catch (_) {}
+
   const binding = platformHost.getSessionBinding(sessionId);
   if (binding?.controlProvider) {
     return binding.controlProvider.inject(binding.handle, event);

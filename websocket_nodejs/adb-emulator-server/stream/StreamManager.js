@@ -63,6 +63,20 @@ const STALL_NOTIFY_MS = clampInt(
   10000
 );
 
+/**
+ * Grace window (ms) after an input event during which a new video frame is
+ * expected. If the user interacted (tap/swipe/key) and no frame arrives within
+ * this window, the encoder is treated as stuck and the capture is reconnected
+ * once. A plain static screen (no input) NEVER triggers this — that prevents
+ * the reconnect loop seen when idle screens produce no VCL frames.
+ */
+const INPUT_STALL_RECOVERY_MS = clampInt(
+  parseInt(process.env.STREAM_INPUT_STALL_RECOVERY_MS, 10),
+  1500,
+  500,
+  10000
+);
+
 function clampInt(value, fallback, lo, hi) {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(hi, Math.max(lo, value));
@@ -301,7 +315,12 @@ class StreamManager {
       entry.stallNotifyTimer = setInterval(() => {
         if (!entry.gate.open) return;
         if (!entry.capture.getStatus().running) return;
-        const idleMs = entry.lastVclSentAt > 0 ? Date.now() - entry.lastVclSentAt : 0;
+        const now = Date.now();
+        const idleMs = entry.lastVclSentAt > 0 ? now - entry.lastVclSentAt : 0;
+
+        // Cosmetic UI hint: the picture is static. This is NORMAL for an idle
+        // screen (scrcpy/MediaCodec only emits on change) and does NOT trigger
+        // any capture teardown.
         const isStalling = idleMs > STALL_NOTIFY_MS;
         if (isStalling && !entry.stallIsNotified) {
           entry.stallIsNotified = true;
@@ -310,11 +329,45 @@ class StreamManager {
             try { sess.send({ type: 'stream_stall', session_id: sessionId, idleMs }); } catch (_) {}
           }
         }
+
+        // Genuine-stuck recovery: the user interacted (input injected) AFTER the
+        // last delivered frame, yet no new frame followed within the grace
+        // window. The screen should have changed but didn't — reconnect once.
+        const inputAfterFrame = entry.lastInputAt > 0
+          && entry.lastInputAt >= (entry.lastVclSentAt || 0);
+        const inputIdleMs = inputAfterFrame ? now - entry.lastInputAt : 0;
+        if (inputAfterFrame
+            && inputIdleMs > INPUT_STALL_RECOVERY_MS
+            && !entry.stallRecoveryRequested
+            && typeof entry.capture?.requestRecovery === 'function') {
+          entry.stallRecoveryRequested = true;
+          logger.warn('Input without frame — requesting capture recovery', {
+            sessionId,
+            inputIdleMs
+          });
+          entry.capture.requestRecovery('input_without_frame').catch((err) => {
+            logger.warn('Capture recovery after input stall failed', {
+              sessionId,
+              error: err.message
+            });
+            entry.stallRecoveryRequested = false;
+          });
+        }
       }, 200);
       if (typeof entry.stallNotifyTimer.unref === 'function') {
         entry.stallNotifyTimer.unref();
       }
     }
+  }
+
+  /**
+   * Record that an input event was injected for this session. Used by the
+   * stall watchdog to distinguish a genuinely stuck encoder (user interacted
+   * but the frame never updated) from a normal static screen.
+   */
+  notifyInput(sessionId) {
+    const entry = this._sessions.get(sessionId);
+    if (entry) entry.lastInputAt = Date.now();
   }
 
   /**
@@ -509,6 +562,7 @@ class StreamManager {
         provider: providerId,
         ...info
       });
+      entry.stallRecoveryRequested = false;
       this._resetCaptureState(entry);
       const sess = entry.session;
       if (sess?.ws?.readyState === 1) {
@@ -794,7 +848,10 @@ class StreamManager {
       firstFrameEmittedAt: 0,
       // Per-heartbeat-window FPS tracking
       prevHeartbeatSent: 0,
-      prevHeartbeatAt: 0
+      prevHeartbeatAt: 0,
+      // Input-correlated stall recovery
+      lastInputAt: 0,
+      stallRecoveryRequested: false
     };
 
     entry.sendParamSetPackets = (packets) => {
@@ -839,6 +896,7 @@ class StreamManager {
     entry.stallIsNotified = false;
     entry.pacer = new OutputPacer(fps, (frame) => {
       entry.lastVclSentAt = Date.now();
+      entry.stallRecoveryRequested = false;
       if (entry.stallIsNotified) {
         entry.stallIsNotified = false;
         const sess = entry.session;

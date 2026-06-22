@@ -133,6 +133,18 @@ namespace EmulatorDesktopApp.Services
         private CancellationTokenSource? _mediaWatchCts;
         private long _mediaWatchStartedTicks;
         private long _firstFrameTicks;
+        // Interaction-correlated freeze watchdog. The server-side WebRTC transport
+        // can silently die (RTP stops arriving) while ICE/DTLS still report
+        // "connected", leaving a permanently frozen picture. We can only safely
+        // distinguish that from a legitimately static screen by user intent: if the
+        // user injects input but no RTP follows within the grace window, the media
+        // path is genuinely stuck and a full re-negotiation is required.
+        private CancellationTokenSource? _freezeWatchCts;
+        private long _lastRtpAtTicks;
+        private long _lastInputAtTicks;
+        private long _lastRecoveryAtTicks;
+        private const int FreezeGraceMs = 2500;
+        private const int FreezeRecoveryCooldownMs = 8000;
         private Action<RTCIceCandidate>? _onIceCandidateHandler;
         private int _iceCandidateLogCount;
         private volatile bool _signalingRelayEnabled;
@@ -507,6 +519,20 @@ namespace EmulatorDesktopApp.Services
         public Action? OnSceneCut { get; set; }
         public event Action<string>? OnLog;
         public event Action<string>? OnError;
+
+        /// <summary>
+        /// Raised when the media path appears genuinely stuck (user injected input
+        /// but no RTP arrived within the grace window). The host should fully
+        /// restart the stream to rebuild the WebRTC transport. Throttled internally
+        /// by <see cref="FreezeRecoveryCooldownMs"/>.
+        /// </summary>
+        public event Action? OnStreamRecoveryNeeded;
+
+        /// <summary>
+        /// Called by the control path whenever a user input event is sent to the
+        /// device, so the freeze watchdog can correlate input with video updates.
+        /// </summary>
+        public void NotifyInputSent() => Interlocked.Exchange(ref _lastInputAtTicks, Stopwatch.GetTimestamp());
 
         public bool IsPeerInitialized => _peerConnection != null;
         public string? CurrentSessionId => _currentSessionId;
@@ -897,6 +923,7 @@ namespace EmulatorDesktopApp.Services
                 return;
 
             var rtpCount = Interlocked.Increment(ref _videoRtpPacketsReceived);
+            Interlocked.Exchange(ref _lastRtpAtTicks, Stopwatch.GetTimestamp());
             if (rtpCount == 1 || rtpCount == 50 || rtpCount % 300 == 0)
             {
                 OnLog?.Invoke(
@@ -1496,6 +1523,76 @@ namespace EmulatorDesktopApp.Services
 
         private void CancelMediaWatch() => _mediaWatchCts?.Cancel();
 
+        /// <summary>
+        /// Continuous, interaction-correlated freeze watchdog. Fires
+        /// <see cref="OnStreamRecoveryNeeded"/> when the user has injected input but
+        /// no RTP has arrived for <see cref="FreezeGraceMs"/> afterwards. Never fires
+        /// on an idle screen (no input → no trigger) and is throttled to at most one
+        /// recovery per <see cref="FreezeRecoveryCooldownMs"/>.
+        /// </summary>
+        private void StartFreezeWatch()
+        {
+            _freezeWatchCts?.Cancel();
+            _freezeWatchCts?.Dispose();
+            _freezeWatchCts = new CancellationTokenSource();
+            var token = _freezeWatchCts.Token;
+
+            _ = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(1000, token);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        return;
+                    }
+
+                    if (token.IsCancellationRequested)
+                        return;
+
+                    // Only meaningful once media has actually flowed at least once.
+                    if (Volatile.Read(ref _videoRtpPacketsReceived) == 0)
+                        continue;
+
+                    var now = Stopwatch.GetTimestamp();
+                    var lastInput = Interlocked.Read(ref _lastInputAtTicks);
+                    var lastRtp = Interlocked.Read(ref _lastRtpAtTicks);
+                    var lastRecovery = Interlocked.Read(ref _lastRecoveryAtTicks);
+
+                    if (lastInput == 0)
+                        continue;
+
+                    // Input must be the most recent event AND old enough that any
+                    // resulting frame should already have arrived.
+                    bool inputAfterFrame = lastInput > lastRtp;
+                    double inputIdleMs = (now - lastInput) * 1000.0 / Stopwatch.Frequency;
+                    double sinceRecoveryMs = lastRecovery == 0
+                        ? double.MaxValue
+                        : (now - lastRecovery) * 1000.0 / Stopwatch.Frequency;
+
+                    if (inputAfterFrame &&
+                        inputIdleMs > FreezeGraceMs &&
+                        sinceRecoveryMs > FreezeRecoveryCooldownMs)
+                    {
+                        Interlocked.Exchange(ref _lastRecoveryAtTicks, now);
+                        OnLog?.Invoke(
+                            $"[WebRTC] Media path stuck — input sent but no RTP for {inputIdleMs / 1000.0:F1}s. " +
+                            "Requesting stream restart.");
+                        try { OnStreamRecoveryNeeded?.Invoke(); }
+                        catch { }
+                    }
+                }
+            }, token);
+        }
+
+        private void CancelFreezeWatch()
+        {
+            _freezeWatchCts?.Cancel();
+        }
+
         private double MediaWatchElapsedSeconds() =>
             _mediaWatchStartedTicks == 0
                 ? 0
@@ -1557,6 +1654,7 @@ namespace EmulatorDesktopApp.Services
 
                 OnStreamStatusChanged?.Invoke(StreamStatus.Starting);
                 ScheduleMediaWatch();
+                StartFreezeWatch();
                 OnLog?.Invoke($"[WebRTC] Answer sent — waiting for media (elapsed {MediaWatchElapsedSeconds():F1}s)");
             }
             catch (Exception ex)
@@ -1847,6 +1945,12 @@ namespace EmulatorDesktopApp.Services
             _mediaWatchCts?.Dispose();
             _mediaWatchCts = null;
             _mediaWatchStartedTicks = 0;
+            CancelFreezeWatch();
+            _freezeWatchCts?.Dispose();
+            _freezeWatchCts = null;
+            _lastRtpAtTicks = 0;
+            _lastInputAtTicks = 0;
+            _lastRecoveryAtTicks = 0;
             _currentSessionId = null;
             _hasRemoteDescription = false;
             _pendingCandidates.Clear();
