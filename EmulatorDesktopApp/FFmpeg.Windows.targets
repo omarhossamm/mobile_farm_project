@@ -4,6 +4,7 @@
 
   <PropertyGroup>
     <FFmpegDestDir>$(MSBuildProjectDirectory)\ffmpeg\win-x64\</FFmpegDestDir>
+    <FFmpegOutDir>$(OutDir)ffmpeg\win-x64\</FFmpegOutDir>
     <FFmpegZipUrl Condition="'$(FFmpegZipUrl)' == ''">https://github.com/GyanD/codexffmpeg/releases/download/8.1/ffmpeg-8.1-full_build-shared.zip</FFmpegZipUrl>
     <FFmpegCacheDir>$(LocalAppData)\EmulatorDesktopApp\ffmpeg-cache</FFmpegCacheDir>
     <FFmpegZipFileName>ffmpeg-8.1-full_build-shared.zip</FFmpegZipFileName>
@@ -16,7 +17,7 @@
     <Content Include="ffmpeg\win-x64\*.dll" Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-      <Link>%(Filename)%(Extension)</Link>
+      <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
       <Visible>false</Visible>
     </Content>
   </ItemGroup>
@@ -101,27 +102,78 @@
 
   <Target Name="_CopyFfmpegNativeToOutputImpl">
     <ItemGroup>
-      <_FfmpegNativeDll Include="$(FFmpegDestDir)*.dll" Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avutil-60.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)swresample-6.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)swscale-9.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avformat-62.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avfilter-11.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avdevice-62.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)avutil-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)avcodec-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)avformat-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)avfilter-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)avdevice-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)swresample-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)swscale-*.dll" />
+      <_StaleFfmpegOutRootDll Include="$(OutDir)postproc-*.dll" />
     </ItemGroup>
-    <MakeDir Directories="$(OutDir)" Condition="!Exists('$(OutDir)')" />
+    <Delete Files="@(_StaleFfmpegOutRootDll)" Condition="'@(_StaleFfmpegOutRootDll)' != ''" />
+    <MakeDir Directories="$(FFmpegOutDir)" Condition="!Exists('$(FFmpegOutDir)')" />
     <Copy SourceFiles="@(_FfmpegNativeDll)"
-          DestinationFolder="$(OutDir)"
+          DestinationFolder="$(FFmpegOutDir)"
           SkipUnchangedFiles="false"
           OverwriteReadOnlyFiles="true"
-          Condition="'@(_FfmpegNativeDll)' != ''" />
+          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
     <Message Importance="high"
-             Text="[FFmpeg] Copied @(_FfmpegNativeDll->Count()) DLL(s) to $(OutDir)"
-             Condition="'@(_FfmpegNativeDll)' != ''" />
+             Text="[FFmpeg] Copied 7 DLL(s) to $(FFmpegOutDir)"
+             Condition="Exists('$(FFmpegDestDir)avutil-60.dll')" />
   </Target>
 
   <Target Name="IncludeProvisionedFfmpegDlls"
           AfterTargets="CopyFfmpegNativeToOutput"
           BeforeTargets="AssignTargetPaths">
     <ItemGroup Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
-      <Content Include="$(FFmpegDestDir)*.dll">
+      <Content Include="$(FFmpegDestDir)avutil-60.dll">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-        <Link>%(Filename)%(Extension)</Link>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)swresample-6.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)swscale-9.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)avcodec-62.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)avformat-62.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)avfilter-11.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
+        <Visible>false</Visible>
+      </Content>
+      <Content Include="$(FFmpegDestDir)avdevice-62.dll">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+        <Link>ffmpeg\win-x64\%(Filename)%(Extension)</Link>
         <Visible>false</Visible>
       </Content>
     </ItemGroup>
