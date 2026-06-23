@@ -191,6 +191,15 @@ async function createIosSession(session, udid, options, payload) {
   sessionManager.assignDevice(session.id, udid);
   bindIosSession(session, device, { ownsDevice });
 
+  const opened = await simctl.openSimulatorApp(udid);
+  if (!opened.success) {
+    logger.warn('Failed to foreground Simulator app', {
+      sessionId: session.id,
+      udid,
+      error: opened.error
+    });
+  }
+
   logger.info('iOS session created', { sessionId: session.id, udid, name: device.name, ownsDevice });
 
   session.sendSuccess('session_created', {

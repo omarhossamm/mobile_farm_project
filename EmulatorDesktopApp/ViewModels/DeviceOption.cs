@@ -22,6 +22,8 @@ public sealed class DeviceOption
 
     public string TargetClass { get; init; } = "device";
 
+    public string DeviceTypeIdentifier { get; init; } = string.Empty;
+
     public bool IsOnline => string.Equals(Status, "online", StringComparison.OrdinalIgnoreCase);
 
     public string PlatformLabel

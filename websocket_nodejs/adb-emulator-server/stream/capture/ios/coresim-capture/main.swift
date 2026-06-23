@@ -303,19 +303,59 @@ func resolveDisplayRenderable(device: AnyObject) -> AnyObject {
         return name.contains("SimDisplayIOSurfaceRenderable")
     }
 
-    // Prefer the primary device display (SimScreen) over auxiliary surfaces.
-    var fallback: AnyObject? = nil
+    // Prefer the primary device display (SimScreen) over auxiliary surfaces,
+    // but only if it currently exposes an IOSurface.
+    var primary: [AnyObject] = []
+    var secondary: [AnyObject] = []
+
+    func hasImmediateSurface(_ descriptor: AnyObject) -> Bool {
+        return callSurface(descriptor, "framebufferSurface") != nil
+            || callSurface(descriptor, "maskedFramebufferSurface") != nil
+    }
+
     for port in ports {
         let descriptor = callObj(port, "descriptor") ?? port
         guard conformsToSurfaceRenderable(descriptor) else { continue }
         let name = String(describing: type(of: descriptor))
         if name.contains("SimScreen") || name.contains("SimDisplayRenderable") {
-            return descriptor
+            primary.append(descriptor)
+        } else {
+            secondary.append(descriptor)
         }
-        if fallback == nil { fallback = descriptor }
     }
-    if let f = fallback { return f }
+    for d in primary where hasImmediateSurface(d) { return d }
+    for d in secondary where hasImmediateSurface(d) { return d }
+    if let d = primary.first { return d }
+    if let d = secondary.first { return d }
     fatal("no SimDisplayIOSurfaceRenderable port found on device")
+}
+
+func advertisedSelectors(_ obj: AnyObject) -> Set<String> {
+    var out: Set<String> = []
+    if let map = callObj(obj, "selectorsToMethodSignatures") as? [AnyHashable: Any] {
+        for k in map.keys {
+            out.insert("\(k)")
+        }
+    }
+    return out
+}
+
+func canInvoke(_ obj: AnyObject, _ selName: String) -> Bool {
+    let sel = NSSelectorFromString(selName)
+    if obj.responds(to: sel) { return true }
+    let advertised = advertisedSelectors(obj)
+    return advertised.contains(selName)
+}
+
+func resolveCurrentSurface(_ renderable: AnyObject) -> IOSurfaceRef? {
+    let selectors = ["framebufferSurface", "maskedFramebufferSurface", "ioSurface", "surface"]
+    for sel in selectors {
+        guard canInvoke(renderable, sel) else { continue }
+        if let s = callSurface(renderable, sel) {
+            return s
+        }
+    }
+    return nil
 }
 
 // MARK: - VideoToolbox encoder
@@ -509,13 +549,13 @@ if args.dump {
 let renderable = resolveDisplayRenderable(device: device)
 
 if args.probeOnly {
-    if let surface = callSurface(renderable, "framebufferSurface") {
+    if let surface = resolveCurrentSurface(renderable) {
         let w = IOSurfaceGetWidth(surface)
         let h = IOSurfaceGetHeight(surface)
         emitLine("PROBE_OK \(w)x\(h)")
         exit(0)
     }
-    fatal("probe: framebufferSurface unavailable")
+    fatal("probe: IOSurface unavailable (tried framebufferSurface, maskedFramebufferSurface, ioSurface, surface)")
 }
 
 let encoder = Encoder(bitrate: args.bitrate, fps: args.fps, keyframeIntervalSec: args.keyframeIntervalSec)
@@ -552,7 +592,7 @@ stdinSource.resume()
 // surface-change callback and also poll at the target fps as a safety net for
 // static screens (where change callbacks may be sparse).
 func tick() {
-    guard let surface = callSurface(renderable, "framebufferSurface") else { return }
+    guard let surface = resolveCurrentSurface(renderable) else { return }
     let w = IOSurfaceGetWidth(surface)
     let h = IOSurfaceGetHeight(surface)
     if w == 0 || h == 0 { return }

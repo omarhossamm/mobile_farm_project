@@ -176,7 +176,7 @@ class AdbInputProvider {
     this.platform = PLATFORMS.ANDROID;
     // keyed by sessionId (or deviceId when sessionId is unavailable)
     this._shells = new Map();
-    /** @type {Map<string, {width: number, height: number}>} */
+    /** @type {Map<string, {width: number, height: number, expiresAt: number}>} */
     this._displaySizes = new Map();
   }
 
@@ -240,12 +240,17 @@ class AdbInputProvider {
       return { width: fromMeta, height: fromMetaH };
     }
 
-    if (this._displaySizes.has(deviceId)) {
-      return this._displaySizes.get(deviceId);
+    // Short TTL so a runtime rotation is picked up quickly. queryDisplaySize
+    // performs `wm size` + `dumpsys input` to return rotation-aware dimensions
+    // (~30–50 ms total) — caching for ~2 seconds avoids hammering adb on every
+    // tap during a swipe while still adapting to orientation changes.
+    const cached = this._displaySizes.get(deviceId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { width: cached.width, height: cached.height };
     }
 
     const size = await queryDisplaySize(deviceId);
-    this._displaySizes.set(deviceId, size);
+    this._displaySizes.set(deviceId, { ...size, expiresAt: Date.now() + 2000 });
     logger.info('Android display size resolved for touch', { deviceId, ...size });
     return size;
   }

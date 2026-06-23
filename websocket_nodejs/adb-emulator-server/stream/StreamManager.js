@@ -759,11 +759,45 @@ class StreamManager {
         }
         try {
           const { CaptureSupervisor } = require('./core/CaptureSupervisor');
-          supervised = await new CaptureSupervisor().selectAndStart({ chain, handle, captureOpts });
+          const firstFrameTimeoutMs = handle.ref.platform === 'ios' ? 15_000 : undefined;
+          supervised = await new CaptureSupervisor({ firstFrameTimeoutMs }).selectAndStart({
+            chain,
+            handle,
+            captureOpts
+          });
         } catch (err) {
-          peerConnectionManager.closePeer(sessionId);
-          logger.error('iOS capture supervisor failed', { sessionId, error: err.message });
-          return { success: false, error: `Capture start failed: ${err.message}` };
+          const iosTransient =
+            handle.ref.platform === 'ios' &&
+            /ios-idb-transcode:\s*(first-frame timeout|stall_no_data)/i.test(err.message || '');
+
+          if (iosTransient) {
+            logger.warn('iOS capture startup transient failure — retrying once', {
+              sessionId,
+              error: err.message
+            });
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            try {
+              chain = await platformHost.registry.resolveCaptureChain(handle);
+              const { CaptureSupervisor } = require('./core/CaptureSupervisor');
+              const firstFrameTimeoutMs = 15_000;
+              supervised = await new CaptureSupervisor({ firstFrameTimeoutMs }).selectAndStart({
+                chain,
+                handle,
+                captureOpts
+              });
+            } catch (retryErr) {
+              peerConnectionManager.closePeer(sessionId);
+              logger.error('iOS capture supervisor failed after retry', {
+                sessionId,
+                error: retryErr.message
+              });
+              return { success: false, error: `Capture start failed: ${retryErr.message}` };
+            }
+          } else {
+            peerConnectionManager.closePeer(sessionId);
+            logger.error('iOS capture supervisor failed', { sessionId, error: err.message });
+            return { success: false, error: `Capture start failed: ${err.message}` };
+          }
         }
         capture = supervised.capture;
         captureProviderId = supervised.providerId;

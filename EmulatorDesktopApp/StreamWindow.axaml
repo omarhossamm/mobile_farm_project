@@ -398,7 +398,7 @@
                              rectangular framebuffer to iPhone screen corners. -->
                         <Border x:Name="IosVideoSurface"
                                 Background="#000000"
-                                CornerRadius="40"
+                            CornerRadius="{Binding IosFrameCornerRadius}"
                                 ClipToBounds="True"
                                 Focusable="True">
                             <Grid>

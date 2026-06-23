@@ -1470,6 +1470,14 @@ namespace EmulatorDesktopApp.ViewModels
             var targetClass = device.TryGetProperty("target_class", out var targetClassElement)
                 ? targetClassElement.GetString() ?? "device"
                 : "device";
+            string deviceTypeIdentifier = string.Empty;
+            if (device.TryGetProperty("metadata", out var metadata) && metadata.ValueKind == JsonValueKind.Object)
+            {
+                if (metadata.TryGetProperty("deviceTypeIdentifier", out var dtiEl))
+                    deviceTypeIdentifier = dtiEl.GetString() ?? string.Empty;
+                else if (metadata.TryGetProperty("device_type_identifier", out var dtiSnakeEl))
+                    deviceTypeIdentifier = dtiSnakeEl.GetString() ?? string.Empty;
+            }
 
             return new DeviceOption
             {
@@ -1479,7 +1487,8 @@ namespace EmulatorDesktopApp.ViewModels
                 Kind = kind,
                 AvdName = avdName,
                 Platform = platform,
-                TargetClass = targetClass
+                TargetClass = targetClass,
+                DeviceTypeIdentifier = deviceTypeIdentifier
             };
         }
 

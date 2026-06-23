@@ -46,12 +46,17 @@ const KNOWN = [
   // SE
   { match: 'iPhone-SE-3rd', w: 375, h: 667, scale: 2 },
   { match: 'iPhone-SE', w: 375, h: 667, scale: 2 },
-  // iPad (representative; @2x)
+  // iPad (representative; @2x). More specific identifiers MUST come before the
+  // generic 'iPad' fallback because matching is first-substring-wins.
   { match: 'iPad-Pro-13', w: 1032, h: 1376, scale: 2 },
   { match: 'iPad-Pro-12-9', w: 1024, h: 1366, scale: 2 },
   { match: 'iPad-Pro-11', w: 834, h: 1194, scale: 2 },
   { match: 'iPad-Air', w: 820, h: 1180, scale: 2 },
   { match: 'iPad-mini', w: 744, h: 1133, scale: 2 },
+  // iPad 10th generation — 10.9", 1640x2360 px @2x → 820x1180 pt.
+  { match: 'iPad-10th-generation', w: 820, h: 1180, scale: 2 },
+  // Generic iPad fallback — last resort. The captured-surface fallback in
+  // resolveDeviceGeometry() will refine this when the surface is known.
   { match: 'iPad', w: 810, h: 1080, scale: 2 }
 ];
 

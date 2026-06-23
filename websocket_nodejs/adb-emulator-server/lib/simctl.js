@@ -120,13 +120,33 @@ async function waitUntilBooted(udid, timeoutMs = 60_000) {
   while (Date.now() < deadline) {
     if (await isBooted(udid)) {
       try {
-        await execFileAsync(XCRUN, baseArgs(['bootstatus', udid]), { timeout: 30_000 });
-      } catch { /* bootstatus exits non-zero on older Xcode; booted is enough */ }
+        await execFileAsync(XCRUN, baseArgs(['bootstatus', udid, '-b']), { timeout: 45_000 });
+      } catch {
+        try {
+          await execFileAsync(XCRUN, baseArgs(['bootstatus', udid]), { timeout: 20_000 });
+        } catch {
+          /* bootstatus unavailable/old Xcode; booted state is final fallback */
+        }
+      }
       return true;
     }
     await new Promise((r) => setTimeout(r, 750));
   }
   return false;
+}
+
+/**
+ * Bring Simulator.app to foreground and target a specific booted UDID.
+ */
+async function openSimulatorApp(udid) {
+  try {
+    await execFileAsync('open', ['-a', 'Simulator', '--args', '-CurrentDeviceUDID', udid], {
+      timeout: 15_000
+    });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.stderr || err.message };
+  }
 }
 
 module.exports = {
@@ -136,5 +156,6 @@ module.exports = {
   boot,
   shutdown,
   screenshot,
-  waitUntilBooted
+  waitUntilBooted,
+  openSimulatorApp
 };

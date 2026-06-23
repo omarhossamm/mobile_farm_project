@@ -28,6 +28,15 @@ public partial class StreamWindow : Window
     private const double IosHorizontalExtra = 76;   // 2 * (18 bezel + 20 margin)
     private const double IosVerticalExtra = 122;    // 46 header + 2 * (18 + 20)
     private static readonly Size DefaultIosAspect = new(393, 852);
+    private static readonly Size DefaultIpadAspect = new(820, 1180);
+
+    // Screen rounded-corner radius is dynamic: a fraction of the rendered
+    // screen rect width so it scales with the displayed simulator. Calibrated
+    // to match the real iOS Simulator screen curvature — modern iPhones have
+    // pronounced rounded corners (~55pt on a 393pt-wide screen ≈ 0.14), while
+    // iPads have a much subtler curve (~18pt on a 820pt-wide screen ≈ 0.022).
+    private const double IphoneScreenCornerRatio = 0.14;
+    private const double IpadScreenCornerRatio = 0.022;
 
     private StreamWindowViewModel? _viewModel;
     private bool _sizeInitialized;
@@ -82,7 +91,7 @@ public partial class StreamWindow : Window
         if (_viewModel?.IsIosViewer == true)
         {
             LayoutUpdated -= OnInitialLayoutUpdated;
-            ApplyCompactSize(DefaultIosAspect);
+            ApplyCompactSize(_viewModel.IsIpadViewer ? DefaultIpadAspect : DefaultIosAspect);
             return;
         }
 
@@ -139,9 +148,21 @@ public partial class StreamWindow : Window
         if (_viewModel?.IsIosViewer == true)
         {
             double screenH = Math.Max(240, targetWindowHeight - IosVerticalExtra);
+            if (_viewModel.IsIpadViewer)
+                screenH = Math.Max(420, screenH);
             double screenW = screenH / aspect;
+            if (_viewModel.IsIpadViewer)
+                screenW = Math.Max(screenW, 560);
             IosVideoSurface.Width = screenW;
             IosVideoSurface.Height = screenH;
+            // Dynamic screen corner radius — scales with the rendered screen size
+            // so it stays proportional and matches the simulator frame curvature.
+            double cornerRatio = _viewModel.IsIpadViewer
+                ? IpadScreenCornerRatio
+                : IphoneScreenCornerRatio;
+            double maxRadius = Math.Min(screenW, screenH) * 0.5;
+            double radius = Math.Min(screenW * cornerRatio, maxRadius);
+            _viewModel.IosFrameCornerRadius = new CornerRadius(radius);
             Width = screenW + IosHorizontalExtra;
             Height = screenH + IosVerticalExtra;
             return;
@@ -191,7 +212,9 @@ public partial class StreamWindow : Window
             }
             else
             {
-                ApplyCompactSize(_viewModel.IsIosViewer ? DefaultIosAspect : DefaultVideoAspect);
+                ApplyCompactSize(_viewModel.IsIosViewer
+                    ? (_viewModel.IsIpadViewer ? DefaultIpadAspect : DefaultIosAspect)
+                    : DefaultVideoAspect);
             }
         }
         else
@@ -256,6 +279,9 @@ public partial class StreamWindow : Window
     private static Size GetVideoFrameSize(StreamWindowViewModel vm)
     {
         var pixelSize = vm.CurrentFrame?.PixelSize ?? default;
+        if (vm.IsIosViewer)
+            return default;
+
         return pixelSize.Width > 0 && pixelSize.Height > 0
             ? new Size(pixelSize.Width, pixelSize.Height)
             : default;
@@ -323,7 +349,9 @@ public partial class StreamWindow : Window
             }
             else
             {
-                ApplyCompactSize(_viewModel.IsIosViewer ? DefaultIosAspect : DefaultVideoAspect);
+                ApplyCompactSize(_viewModel.IsIosViewer
+                    ? (_viewModel.IsIpadViewer ? DefaultIpadAspect : DefaultIosAspect)
+                    : DefaultVideoAspect);
             }
         }
     }

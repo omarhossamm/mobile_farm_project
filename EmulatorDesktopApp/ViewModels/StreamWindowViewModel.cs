@@ -174,6 +174,22 @@ namespace EmulatorDesktopApp.ViewModels
     /// <summary>Secondary line in the iOS chrome header.</summary>
     public string IosRuntimeLabel => "iOS Simulator";
 
+    public bool IsIpadViewer
+    {
+        get
+        {
+            var device = _mainViewModel.SelectedDevice;
+            if (!IsIosViewer || device == null)
+                return false;
+
+            if (!string.IsNullOrEmpty(device.DeviceTypeIdentifier) &&
+                device.DeviceTypeIdentifier.Contains("iPad", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return device.DisplayName?.Contains("iPad", StringComparison.OrdinalIgnoreCase) == true;
+        }
+    }
+
     public string DeviceLabel
     {
         get
@@ -185,6 +201,28 @@ namespace EmulatorDesktopApp.ViewModels
             if (!string.IsNullOrEmpty(id))
                 return id;
             return IsIosViewer ? "iOS Simulator" : "Android Emulator";
+        }
+    }
+
+    // Screen rounded-corner radius for the iOS device-frame viewer. Updated by
+    // StreamWindow.ApplyCompactSize() so the radius scales with the actual
+    // rendered screen rect, keeping the rounded screen edge proportional and
+    // matching the bezel inner curve for both iPhone and iPad simulators.
+    //
+    // NOTE: type is Avalonia.CornerRadius (not double) so the XAML binding to
+    // Border.CornerRadius resolves directly — runtime bindings do not invoke
+    // the XAML-time double→CornerRadius type converter, which is why a double
+    // property would silently fall back to the default zero-radius corners and
+    // let the rectangular image poke out past the bezel.
+    private Avalonia.CornerRadius _iosFrameCornerRadius = new(34);
+    public Avalonia.CornerRadius IosFrameCornerRadius
+    {
+        get => _iosFrameCornerRadius;
+        set
+        {
+            if (_iosFrameCornerRadius.Equals(value)) return;
+            _iosFrameCornerRadius = value;
+            OnPropertyChanged();
         }
     }
 

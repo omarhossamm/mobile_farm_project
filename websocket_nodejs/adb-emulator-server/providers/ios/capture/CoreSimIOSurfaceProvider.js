@@ -14,6 +14,7 @@
 const { PLATFORMS } = require('../../../platform/types');
 const { CoreSimIOSurfaceStream, probeCoreSim } = require('../../../stream/capture/ios/CoreSimIOSurfaceStream');
 const { createLogger } = require('../../../lib/logger');
+const simctl = require('../../../lib/simctl');
 
 const logger = createLogger('CORESIM_PROV');
 
@@ -32,17 +33,35 @@ class CoreSimIOSurfaceProvider {
     if (ref.status !== 'online') {
       return { canCapture: false, reason: 'simulator not booted' };
     }
-    let result;
-    try {
-      result = await probeCoreSim(ref.id);
-    } catch (err) {
-      return { canCapture: false, reason: `coresim probe threw: ${err.message}` };
-    }
-    if (!result.ok) {
-      logger.warn('coresim probe failed — will fall back to transcode', {
-        udid: ref.id, reason: result.reason
+    await simctl.waitUntilBooted(ref.id, 20_000);
+    await simctl.openSimulatorApp(ref.id);
+
+    let result = null;
+    const delays = [0, 1200, 2200];
+    for (let i = 0; i < delays.length; i++) {
+      if (delays[i] > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delays[i]));
+      }
+      try {
+        result = await probeCoreSim(ref.id);
+      } catch (err) {
+        result = { ok: false, reason: `coresim probe threw: ${err.message}` };
+      }
+      if (result.ok) break;
+      logger.warn('coresim probe attempt failed', {
+        udid: ref.id,
+        attempt: i + 1,
+        attempts: delays.length,
+        reason: result.reason
       });
-      return { canCapture: false, reason: result.reason };
+    }
+
+    if (!result?.ok) {
+      logger.warn('coresim probe failed — will fall back to transcode', {
+        udid: ref.id,
+        reason: result?.reason || 'unknown'
+      });
+      return { canCapture: false, reason: result?.reason || 'coresim probe failed' };
     }
     logger.info('coresim probe passed', { udid: ref.id, surface: result.surface });
     return {

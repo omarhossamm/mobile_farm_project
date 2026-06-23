@@ -32,8 +32,65 @@ function parseWmSizeOutput(out) {
   return null;
 }
 
-function queryDisplaySize(deviceId) {
+/**
+ * Capture stdout of an `adb shell` invocation. Never rejects — returns '' on
+ * error so callers can fall back to defaults instead of failing the whole tap.
+ */
+function shellCapture(deviceId, cmd) {
   return new Promise((resolve) => {
+    const args = ['-s', deviceId, 'shell', ...(Array.isArray(cmd) ? cmd : [cmd])];
+    const proc = spawn(streamConfig.adbPath, args, {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.on('close', () => resolve(out));
+    proc.on('error', () => resolve(''));
+  });
+}
+
+/**
+ * Resolve the device's CURRENT display rotation in quarter-turns:
+ *   0 → 0°   1 → 90°   2 → 180°   3 → 270°
+ *
+ * Tries `dumpsys input` for `SurfaceOrientation`, then falls back to the
+ * `user_rotation` system setting. Returns 0 if nothing parses — this is the
+ * safe default for non-rotated devices (the common phone case).
+ */
+async function queryDeviceRotation(deviceId) {
+  // Preferred: `dumpsys input` reports SurfaceOrientation per display, which
+  // tracks the actual on-screen rotation (matches what scrcpy captures).
+  const dump = await shellCapture(deviceId, 'dumpsys input');
+  const surfMatch = dump.match(/SurfaceOrientation:\s*(\d+)/);
+  if (surfMatch) {
+    const n = parseInt(surfMatch[1], 10);
+    if (n >= 0 && n <= 3) return n;
+  }
+
+  // Fallback: user_rotation. Reflects the user-set rotation; usually matches
+  // SurfaceOrientation unless the app forces an orientation.
+  const setting = (await shellCapture(deviceId, 'settings get system user_rotation')).trim();
+  const n = parseInt(setting, 10);
+  if (Number.isFinite(n) && n >= 0 && n <= 3) return n;
+
+  return 0;
+}
+
+/**
+ * Returns the display dimensions in the CURRENT rotation's coordinate space.
+ *
+ * `wm size` reports the panel's NATURAL-orientation dimensions, but
+ * `input tap X Y` injects MotionEvents in the CURRENT-rotation coordinate
+ * space (the same one the user sees and that scrcpy captures). When the
+ * device is rotated 90° or 270° away from natural — common for tablet AVDs
+ * (Pixel Tablet, Pixel C, Nexus 9) that boot landscape from a portrait-natural
+ * panel — those two spaces have swapped axes. Taps then land at the wrong
+ * point (the iPad-style logical-size mismatch).
+ *
+ * Phones in their natural portrait orientation (rotation 0) are unaffected.
+ */
+async function queryDisplaySize(deviceId) {
+  const natural = await new Promise((resolve) => {
     const proc = spawn(streamConfig.adbPath, ['-s', deviceId, 'shell', 'wm', 'size']);
     let out = '';
     proc.stdout.on('data', (d) => { out += d.toString(); });
@@ -43,6 +100,12 @@ function queryDisplaySize(deviceId) {
     });
     proc.on('error', () => resolve({ width: 1080, height: 1920 }));
   });
+
+  const rotation = await queryDeviceRotation(deviceId);
+  if (rotation === 1 || rotation === 3) {
+    return { width: natural.height, height: natural.width };
+  }
+  return natural;
 }
 
 async function injectInput(deviceId, displaySize, event) {
