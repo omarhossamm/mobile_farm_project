@@ -30,6 +30,19 @@ dotnet build
 dotnet run
 ```
 
+## macOS App Icon (Dock)
+
+On macOS, launching the raw published binary can show the default Dock icon. Build and run the `.app` bundle instead:
+
+```bash
+cd EmulatorDesktopApp
+chmod +x scripts/package-macos-app.sh
+./scripts/package-macos-app.sh
+open bin/Release/net10.0/osx-arm64/EmulatorDesktopApp.app
+```
+
+The script generates `EmulatorDesktopApp.icns` from `Assets/generated/app-icon-source.png` and writes `Info.plist` with `CFBundleIconFile`, which is what Dock uses.
+
 ## Project Structure
 
 ```

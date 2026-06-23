@@ -4,6 +4,7 @@
         x:Class="EmulatorDesktopApp.StreamWindow"
         x:DataType="vm:StreamWindowViewModel"
         Title="{Binding WindowTitle}"
+        Icon="/Assets/generated/stream-icon.png"
         Width="417"
         Height="680"
         MinWidth="320"

@@ -1,7 +1,9 @@
+using System;
+using System.ComponentModel;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Threading;
 using EmulatorDesktopApp.ViewModels;
-using System.ComponentModel;
 
 namespace EmulatorDesktopApp;
 
@@ -18,6 +20,37 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = new MainWindowViewModel(OpenStreamWindow, CloseStreamWindow);
         Loaded += OnWindowLoaded;
+    }
+
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        ApplyDynamicStartupSize();
+    }
+
+    /// Size the window to a fraction of the current monitor's work area so it
+    /// scales with the machine's screen, then re-center it. The window stays
+    /// freely resizable (Avalonia windows are resizable by default).
+    private void ApplyDynamicStartupSize()
+    {
+        var screen = Screens?.ScreenFromWindow(this) ?? Screens?.Primary;
+        if (screen == null)
+            return;
+
+        double scaling = screen.Scaling <= 0 ? 1.0 : screen.Scaling;
+        var workArea = screen.WorkingArea;
+        double logicalWidth = workArea.Width / scaling;
+        double logicalHeight = workArea.Height / scaling;
+
+        double width = Math.Clamp(logicalWidth * 0.80, MinWidth, logicalWidth);
+        double height = Math.Clamp(logicalHeight * 0.85, MinHeight, logicalHeight);
+
+        Width = width;
+        Height = height;
+
+        int x = workArea.X + (int)((workArea.Width - width * scaling) / 2);
+        int y = workArea.Y + (int)((workArea.Height - height * scaling) / 2);
+        Position = new PixelPoint(x, y);
     }
 
     private void OpenStreamWindow(StreamWindowViewModel viewModel)

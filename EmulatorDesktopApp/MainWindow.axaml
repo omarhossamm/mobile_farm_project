@@ -7,6 +7,7 @@
         x:Class="EmulatorDesktopApp.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="Android Emulator Control Panel"
+        Icon="/Assets/generated/app-icon.png"
         Width="1100" Height="800"
         MinWidth="900" MinHeight="600"
         WindowStartupLocation="CenterScreen"

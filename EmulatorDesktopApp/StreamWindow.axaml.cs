@@ -14,11 +14,17 @@ public partial class StreamWindow : Window
     private const double DefaultVideoWidth = 400;
     private static readonly Size DefaultVideoAspect = new(720, 1280);
 
-    // iOS Simulator viewer geometry. The screen has a fixed width; height is
-    // derived from the streamed aspect. The window grows by the bezel + device
-    // margin (both sides) plus the chrome header. These mirror StreamWindow.axaml
-    // (Border padding 13 + border 5 = 18 bezel; device Margin 20; header 46).
-    private const double IosScreenWidth = 300;
+    // Portrait mirror windows are sized to fill this fraction of the current
+    // monitor's work-area height, then the width follows from the device aspect.
+    // This makes the viewer scale with the machine's screen; the user can still
+    // freely resize afterwards (Stretch=Uniform keeps the picture undistorted).
+    private const double ScreenFillFraction = 0.85;
+
+    // iOS Simulator viewer geometry. The screen height is derived from the
+    // target window height (screen-relative) and the width follows the streamed
+    // aspect. The window grows by the bezel + device margin (both sides) plus the
+    // chrome header. These mirror StreamWindow.axaml (Border padding 13 + border
+    // 5 = 18 bezel; device Margin 20; header 46).
     private const double IosHorizontalExtra = 76;   // 2 * (18 bezel + 20 margin)
     private const double IosVerticalExtra = 122;    // 46 header + 2 * (18 + 20)
     private static readonly Size DefaultIosAspect = new(393, 852);
@@ -126,13 +132,14 @@ public partial class StreamWindow : Window
             return;
 
         double aspect = videoPixelSize.Height / videoPixelSize.Width;
+        double targetWindowHeight = TargetWindowHeight();
 
         // iOS Simulator viewer: size the screen rect inside the device frame and
         // grow the window by the frame chrome. Leaves the Android path untouched.
         if (_viewModel?.IsIosViewer == true)
         {
-            double screenW = IosScreenWidth;
-            double screenH = screenW * aspect;
+            double screenH = Math.Max(240, targetWindowHeight - IosVerticalExtra);
+            double screenW = screenH / aspect;
             IosVideoSurface.Width = screenW;
             IosVideoSurface.Height = screenH;
             Width = screenW + IosHorizontalExtra;
@@ -143,12 +150,28 @@ public partial class StreamWindow : Window
         if (AppBar.Bounds.Height > 0)
             _appBarHeight = AppBar.Bounds.Height;
 
-        double videoWidth = DefaultVideoWidth;
-        double videoHeight = videoWidth * aspect;
+        double videoHeight = Math.Max(240, targetWindowHeight - _appBarHeight);
+        double videoWidth = videoHeight / aspect;
 
         VideoColumn.Width = videoWidth;
         Width = videoWidth + MirrorToolbarDivider + ToolbarWidth;
         Height = _appBarHeight + videoHeight;
+    }
+
+    /// Target overall window height: a fraction of the current monitor's work
+    /// area, clamped to the window's minimum. Falls back to the previous fixed
+    /// layout heights when no screen info is available.
+    private double TargetWindowHeight()
+    {
+        var screen = Screens?.ScreenFromWindow(this) ?? Screens?.Primary;
+        if (screen == null)
+            return DefaultVideoWidth * (DefaultVideoAspect.Height / DefaultVideoAspect.Width) + _appBarHeight;
+
+        double scaling = screen.Scaling <= 0 ? 1.0 : screen.Scaling;
+        double logicalHeight = screen.WorkingArea.Height / scaling;
+        double target = logicalHeight * ScreenFillFraction;
+        double minH = MinHeight > 0 ? MinHeight : 480;
+        return Math.Clamp(target, minH, logicalHeight);
     }
 
     private void ToggleFullscreen()
