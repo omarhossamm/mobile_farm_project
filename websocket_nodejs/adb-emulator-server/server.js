@@ -19,6 +19,7 @@ const { streamManager } = require('./stream');
 const { killOrphanedScrcpyOnDevice } = require('./stream/capture/android/ScrcpyCaptureStream');
 const { buildDeviceCatalog, resolveAvdNameForDevice } = require('./devicesCatalog');
 const { platformHost } = require('./platform');
+const flutterRunner = require('./flutter/FlutterRunner');
 const simctl = require('./lib/simctl');
 const { resolveDeviceGeometry } = require('./config/iosDeviceSizes');
 
@@ -565,6 +566,97 @@ const messageHandlers = {
       emulator_name: released.emulatorName,
       emulator_killed: released.emulatorKilled
     }, payload.requestId);
+  },
+
+  /**
+   * Attach the current WS session to a device already reserved by a
+   * PRIMARY session on another WebSocket.
+   *
+   * Use case: the VS Code extension creates a session (reserves the
+   * device and starts `flutter run` on the remote) and hands the
+   * session id off to the local streaming window. The streaming
+   * window connects on its own WebSocket and calls attach_session,
+   * which copies `deviceId` / `emulatorName` from the primary session
+   * to this session so `start_stream`, `webrtc_offer`, `control`,
+   * etc. all work — without stealing the reservation from the primary.
+   *
+   * The attached session is marked `ownsEmulator = false` so its
+   * disconnect does NOT tear down the emulator; only the primary can
+   * do that.
+   */
+  attach_session: async (session, payload) => {
+    const { session_id: targetId } = payload || {};
+    if (!targetId) {
+      session.sendError('session_attached', 'session_id is required', payload?.requestId);
+      return;
+    }
+    const target = sessionManager.getSession(targetId);
+    if (!target) {
+      session.sendError('session_attached', `No such session "${targetId}"`, payload?.requestId);
+      return;
+    }
+    if (!target.deviceId) {
+      session.sendError('session_attached', `Session "${targetId}" has no device assigned`, payload?.requestId);
+      return;
+    }
+    if (!target.deviceHandle) {
+      // Should not happen — every session that got a device via create_session
+      // also gets a deviceHandle set by bindPlatformSession/bindIosSession.
+      // If we see this it means the primary was created before that plumbing
+      // ran and we cannot safely infer the platform. Fail loudly instead of
+      // guessing (guessing wrong is exactly what caused the iOS→adb-screenrecord
+      // and Android-touch-dead regressions).
+      session.sendError('session_attached',
+        `Session "${targetId}" has no deviceHandle — cannot route capture/control to a co-holder without knowing its platform`,
+        payload?.requestId);
+      return;
+    }
+
+    // Bypass sessionManager.assignDevice's exclusivity check: this WS is a
+    // co-holder, not a new owner. Set the fields directly so downstream
+    // handlers (start_stream, control, ...) see a device on this session too.
+    session.deviceId = target.deviceId;
+    session.emulatorName = target.emulatorName;
+    session.ownsEmulator = false;
+    session.metadata = session.metadata || {};
+    session.metadata.attachedTo = target.id;
+
+    // Clone the primary's deviceHandle for this session with our own
+    // sessionId + non-owner flag, then register it with platformHost so:
+    //   • StreamManager.startStream() picks the correct capture chain for
+    //     the actual platform (iOS: coresim/idb-transcode ; Android:
+    //     scrcpy → screenrecord).
+    //   • routeControl() finds a control provider keyed by THIS session's
+    //     id (idb-hid for iOS, adb-input for Android).
+    //
+    // Without this the attached session would fall through to the legacy
+    // Android fallback in both paths — which is exactly what broke touch on
+    // Android and killed the stream on iOS after the extension took over
+    // session creation.
+    const cloned = {
+      ref: target.deviceHandle.ref,
+      sessionId: session.id,
+      hostId: target.deviceHandle.hostId,
+      leaseId: session.id,
+      ownedBySession: false,
+    };
+    session.deviceHandle = cloned;
+    platformHost.bindSession(session.id, cloned);
+
+    session.updateActivity();
+    logger.info('Session attached', {
+      sessionId: session.id,
+      attachedTo: target.id,
+      deviceId: target.deviceId,
+      platform: cloned.ref.platform,
+    });
+    session.sendSuccess('session_attached', {
+      session_id: session.id,
+      attached_to: target.id,
+      device_id: target.deviceId,
+      emulator_name: target.emulatorName,
+      platform: cloned.ref.platform,
+    }, payload?.requestId);
   },
 
   /**
@@ -1185,7 +1277,16 @@ const messageHandlers = {
     } else {
       session.sendError('ice_candidate_received', relay.error, payload.requestId);
     }
-  }
+  },
+
+  // ── Remote Flutter execution ────────────────────────────────────────
+  // These endpoints let a thin-client extension (VS Code) drive
+  // `flutter run` entirely on the server host. The developer never
+  // needs Flutter SDK, ADB, or Xcode locally.  See flutter/FlutterRunner.js.
+  list_projects:   (session, payload) => flutterRunner.list_projects(session, payload),
+  run_flutter:     (session, payload) => flutterRunner.run_flutter(session, payload),
+  stop_flutter:    (session, payload) => flutterRunner.stop_flutter(session, payload),
+  flutter_hotkey:  (session, payload) => flutterRunner.flutter_hotkey(session, payload),
 };
 
 /**
@@ -1333,7 +1434,14 @@ async function startServer() {
         ownedEmulator: session.ownsEmulator,
         streamState: session.streamState
       });
-      
+
+      // Kill any flutter runs owned by this session first so a
+      // dropped extension never leaves a dangling `flutter run` on
+      // the remote host. Best-effort — the removeSession below still
+      // runs regardless.
+      try { await flutterRunner.handleSessionClose(session.id); }
+      catch (err) { logger.warn('flutter cleanup failed', { sessionId: session.id, error: err.message }); }
+
       await sessionManager.removeSession(session.id, {
         killEmulator: KILL_EMULATOR_ON_DISCONNECT
       });

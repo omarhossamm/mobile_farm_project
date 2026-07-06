@@ -8,10 +8,17 @@ namespace EmulatorDesktopApp;
 /// extension launches this app it passes:
 ///   --server ws://host:port         (WebSocket URL)
 ///   --device DEVICE_ID              (pin the target emulator/simulator)
+///   --session-id GUID               (attach to a session already
+///                                    created by the extension on
+///                                    another WebSocket — the desktop
+///                                    app then skips create_session
+///                                    and calls attach_session
+///                                    instead, so the device stays
+///                                    reserved by the extension)
 ///   --auto-start                    (skip the manual click-through:
-///                                    connect, pick device, create
-///                                    session, start streaming — all
-///                                    automatically)
+///                                    connect, pick device, attach or
+///                                    create session, start streaming
+///                                    — all automatically)
 ///   --no-manual-controls            (optional: hide the top toolbar
 ///                                    since the extension owns the flow)
 ///
@@ -22,6 +29,7 @@ public sealed class LaunchOptions
 {
     public string? Server { get; init; }
     public string? DeviceId { get; init; }
+    public string? SessionId { get; init; }
     public bool AutoStart { get; init; }
     public bool NoManualControls { get; init; }
 
@@ -32,6 +40,7 @@ public sealed class LaunchOptions
     {
         string? server = null;
         string? deviceId = null;
+        string? sessionId = null;
         bool autoStart = false;
         bool noManualControls = false;
 
@@ -48,6 +57,9 @@ public sealed class LaunchOptions
                 case "-d":
                     if (i + 1 < args.Length) { deviceId = args[++i]; }
                     break;
+                case "--session-id":
+                    if (i + 1 < args.Length) { sessionId = args[++i]; }
+                    break;
                 case "--auto-start":
                 case "--auto":
                     autoStart = true;
@@ -56,8 +68,9 @@ public sealed class LaunchOptions
                     noManualControls = true;
                     break;
                 default:
-                    if (a.StartsWith("--server=", StringComparison.Ordinal)) server = a.Substring("--server=".Length);
-                    else if (a.StartsWith("--device=", StringComparison.Ordinal)) deviceId = a.Substring("--device=".Length);
+                    if      (a.StartsWith("--server=",     StringComparison.Ordinal)) server    = a.Substring("--server=".Length);
+                    else if (a.StartsWith("--device=",     StringComparison.Ordinal)) deviceId  = a.Substring("--device=".Length);
+                    else if (a.StartsWith("--session-id=", StringComparison.Ordinal)) sessionId = a.Substring("--session-id=".Length);
                     break;
             }
         }
@@ -66,6 +79,7 @@ public sealed class LaunchOptions
         {
             Server = server,
             DeviceId = deviceId,
+            SessionId = sessionId,
             AutoStart = autoStart,
             NoManualControls = noManualControls,
         };

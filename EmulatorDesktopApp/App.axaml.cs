@@ -69,7 +69,7 @@ public partial class App : Application
         {
             try
             {
-                await vm.AutoStartAsync(opts.Server!, opts.DeviceId!);
+                await vm.AutoStartAsync(opts.Server!, opts.DeviceId!, opts.SessionId);
             }
             catch
             {

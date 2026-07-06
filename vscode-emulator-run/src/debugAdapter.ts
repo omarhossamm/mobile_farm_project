@@ -6,17 +6,16 @@ import { DeviceInUseError } from './devicePicker';
 /**
  * Inline Debug Adapter.
  *
- * We implement the tiny subset of DAP needed to make VS Code show the
- * native "Running" state with a Stop button:
+ * Implements the subset of DAP that VS Code needs to show the native
+ * Running / Stop debug controls:
  *
- *   initialize          → reply with minimal capabilities
- *   launch              → kick off the orchestrator
- *   configurationDone   → ack, orchestrator continues on its own
- *   disconnect          → ordered shutdown
+ *   initialize          → advertise minimal capabilities
+ *   launch              → hand off to Orchestrator.start()
+ *   configurationDone   → ack
+ *   disconnect/terminate→ Orchestrator.stop()
  *
- * All Flutter stdout/stderr and our own status messages come out as
- * DAP `output` events. When everything is torn down we emit
- * `terminated` which cleanly ends the debug session.
+ * Everything else (project + device selection, remote flutter runner,
+ * stream window lifecycle) is delegated to Orchestrator.
  */
 export class EmulatorStreamAdapter implements vscode.DebugAdapter {
   private readonly _onDidSendMessage = new vscode.EventEmitter<vscode.DebugProtocolMessage>();
@@ -26,7 +25,8 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
   private terminated = false;
 
   constructor(
-    private readonly session: vscode.DebugSession,
+    private readonly _session: vscode.DebugSession,
+    private readonly context: vscode.ExtensionContext | undefined,
     private readonly workspaceFolder?: vscode.WorkspaceFolder
   ) {}
 
@@ -51,12 +51,9 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
         void this.handleStop(msg, msg.command === 'terminate' ? 'terminate' : 'disconnect');
         return;
       case 'threads':
-        // VS Code sometimes asks; we're not really a debugger, so return
-        // a single fake thread to satisfy the client.
         this.reply(msg, { threads: [{ id: 1, name: 'emulator-stream' }] });
         return;
       default:
-        // Unknown → reply with an empty body so VS Code doesn't stall.
         this.reply(msg, {});
     }
   }
@@ -66,32 +63,28 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
     if (this.orchestrator && !this.terminated) void this.orchestrator.stop('adapter_dispose');
   }
 
-  // ── Handlers ───────────────────────────────────────────────────────────
-
   private async handleLaunch(msg: DAPMessage): Promise<void> {
     const config = (msg.arguments ?? {}) as LaunchConfig;
     const settings = resolveSettings(config, this.workspaceFolder);
     this.info(`Server:          ${settings.server}`);
-    this.info(`Desktop app:     ${settings.desktopAppPath ?? '(not bundled — will refuse to open stream window)'}`);
-    this.info(`Flutter path:    ${settings.flutterPath}`);
-    this.info(`Flutter project: ${settings.flutterProject}`);
-    if (settings.device) this.info(`Pinned device:   ${settings.device}`);
+    this.info(`Desktop app:     ${settings.desktopAppPath ?? '(not bundled — stream window will not open)'}`);
+    if (settings.device)    this.info(`Pinned device:   ${settings.device}`);
+    if (settings.projectId) this.info(`Pinned project:  ${settings.projectId}`);
+    if (settings.flavor)    this.info(`Pinned flavor:   ${settings.flavor}`);
 
-    const orchestrator = new Orchestrator();
+    const workspaceKey = this.workspaceFolder?.uri.toString() ?? 'default';
+    const orchestrator = new Orchestrator(workspaceKey, this.context?.workspaceState);
     this.orchestrator = orchestrator;
 
     orchestrator.on('output', (line: string, category: 'stdout' | 'stderr' | 'console') => {
       this.sendEvent('output', { category, output: line });
     });
     orchestrator.on('status', (status: string) => {
-      // Also emit as a "console" output for a nice log trail.
       this.sendEvent('output', { category: 'console', output: `▸ ${status}\n` });
     });
     orchestrator.on('terminated', () => this.finishTerminated());
     orchestrator.on('error', (err: Error) => this.info(`[extension] error: ${err.message}`));
 
-    // Reply to launch immediately so VS Code shows Running. The
-    // orchestrator does the real work asynchronously.
     this.reply(msg, {});
 
     try {
@@ -99,13 +92,8 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.info(`[extension] launch aborted: ${message}`);
-      // Device-in-use gets a warning (it's a user-recoverable state:
-      // "pick another device"), everything else stays a hard error.
       if (err instanceof DeviceInUseError) {
-        void vscode.window.showWarningMessage(
-          `Emulator Stream: ${message}`,
-          { modal: false }
-        );
+        void vscode.window.showWarningMessage(`Emulator Stream: ${message}`, { modal: false });
       } else {
         void vscode.window.showErrorMessage(`Emulator Stream: ${message}`);
       }
@@ -114,7 +102,6 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
   }
 
   private async handleStop(msg: DAPMessage, reason: string): Promise<void> {
-    // Reply immediately so VS Code doesn't hang on the request.
     this.reply(msg, {});
     if (this.orchestrator) await this.orchestrator.stop(`vscode_${reason}`);
     else this.finishTerminated();

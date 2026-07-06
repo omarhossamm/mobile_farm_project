@@ -325,10 +325,22 @@ class SessionManager {
       }
     }
     
-    // Clean up device mapping
+    // Clean up device mapping — only if THIS session actually owned it.
+    // Attached sessions share the device with a primary owner without
+    // ever inserting themselves into deviceToSession, so we must not
+    // blindly delete the mapping when they leave.
     if (session.deviceId) {
-      this.deviceToSession.delete(session.deviceId);
-      logger.info(`Device mapping removed`, { sessionId, deviceId: session.deviceId });
+      const mappedOwner = this.deviceToSession.get(session.deviceId);
+      if (mappedOwner === sessionId) {
+        this.deviceToSession.delete(session.deviceId);
+        logger.info(`Device mapping removed`, { sessionId, deviceId: session.deviceId });
+      } else {
+        logger.info(`Attached session closed — device stays with primary owner`, {
+          sessionId,
+          deviceId: session.deviceId,
+          primaryOwner: mappedOwner ?? null,
+        });
+      }
     }
     
     // Mark as disconnected and remove

@@ -1,121 +1,180 @@
 # Emulator Stream Run (VS Code / Cursor extension)
 
-Run a Flutter app on a remote emulator/simulator with **one click**. The extension is a thin orchestrator that lives inside VS Code: it picks a device from your running gateway server, spawns `flutter run` locally, and launches the existing `EmulatorDesktopApp` (Avalonia .NET) to display the live stream. That's it.
+Run a Flutter app on a **remote** emulator/simulator with one click, BrowserStack-style. Your laptop only needs VS Code + this extension: it never runs `flutter`, `adb`, or `xcodebuild`.
 
-## The 3-component architecture
+## Architecture (thin-client model)
 
 ```
-   ┌────────────────────────┐
-   │  Gateway server        │  ws://<host>:8080  ← you run this
-   │  (websocket_nodejs/)   │
-   └────────┬───────────────┘
-            │
-            │ WebRTC + WS control channel
-            │
-   ┌────────▼───────────────┐
-   │  EmulatorDesktopApp    │  ← owns session, WebRTC, freeze recovery,
-   │  (Avalonia .NET)       │    stream restart, control mapping — the
-   │                        │    battle-tested client, unchanged.
-   └────────▲───────────────┘
-            │
-            │ launched with:
-            │   --server ws://... --device <id> --auto-start
-            │
-   ┌────────┴───────────────┐
-   │  VS Code extension     │  ← device picker, `flutter run`, spawn the
-   │  (vscode-emulator-run/)│    desktop app, unwind on Stop.
-   └────────────────────────┘
+   ┌──────────────────────────────────────────────┐
+   │  Developer machine                           │
+   │                                              │
+   │    VS Code + this extension    (thin client) │
+   │       │                                      │
+   │       │  ws://REMOTE:8080                    │
+   │       ▼                                      │
+   │    EmulatorDesktopApp          (streaming    │
+   │    (Avalonia .NET, bundled)     window +     │
+   │                                 touch input) │
+   └──────────────────────────────────────────────┘
+                       │
+                       │  WebSocket + WebRTC
+                       ▼
+   ┌──────────────────────────────────────────────┐
+   │  Remote machine  (does ALL the heavy lifting)│
+   │                                              │
+   │    Gateway server (websocket_nodejs/)        │
+   │      • Device catalog (adb, simctl)          │
+   │      • Session manager                       │
+   │      • FlutterRunnerService                  │
+   │      • WebRTC signaling / streaming          │
+   │                                              │
+   │    Flutter SDK + Android SDK + Xcode         │
+   │    Flutter projects (on disk)                │
+   │    Android emulators / iOS simulators / real │
+   │    devices                                   │
+   └──────────────────────────────────────────────┘
 ```
 
-The extension **only** does:
+The developer machine has **zero** dependencies beyond:
+* VS Code / Cursor
+* This extension (which auto-bundles the desktop-app streaming viewer)
+* .NET runtime (needed by the streaming viewer — installable in seconds)
 
-1. Short WebSocket to the server → `get_devices` → close socket.
-2. Quick Pick to choose the device (auto-selects if just one).
-3. `flutter run -d <id>` in your Flutter project.
-4. Spawn `EmulatorDesktopApp --server X --device Y --auto-start`.
-5. On Stop → `q` to Flutter (grace period → SIGTERM → SIGKILL) and SIGTERM the desktop app.
+Everything else — Flutter SDK, Android SDK, Xcode, adb, simctl, the Flutter project source, the device — lives on the **remote** host.
 
-Everything session-, WebRTC-, and streaming-related is owned by the desktop app.
+## One-time server setup (remote machine)
 
-When launched with `--auto-start`, the desktop app runs in **headless mode**: its main control window is never created, only the streaming window is shown. Closing the streaming window quits the app.
+Edit `websocket_nodejs/adb-emulator-server/flutter-projects.json` to register the Flutter projects this server should expose to clients:
 
-## Install (one command, one time)
+```json
+{
+  "projects": [
+    {
+      "id": "elm-employee-hub",
+      "name": "ELM Employee Hub",
+      "path": "/Users/ci/projects/elm-employee-hub",
+      "flutterPath": "flutter"
+    }
+  ]
+}
+```
+
+`flavors` is optional — if omitted, the server auto-derives them from the project's `.vscode/launch.json` (any `type: "dart"` config) and its `lib/main_*.dart` files. Explicitly listing them looks like:
+
+```json
+"flavors": [
+  { "name": "development", "target": "lib/main_development.dart", "flavor": "development" },
+  { "name": "production",  "target": "lib/main_production.dart",  "flavor": "production", "args": ["--dart-define=API=prod"] }
+]
+```
+
+Start the gateway server as usual:
+
+```bash
+cd websocket_nodejs/adb-emulator-server
+npm install
+node server.js
+```
+
+## Developer-machine setup
 
 ```bash
 cd vscode-emulator-run
-npm install
+npm install                # postinstall publishes the streaming viewer into vendor/desktop-app
 ```
 
-`npm install` runs a bootstrap script that:
+Then either:
+- **Symlink into VS Code extensions** (`~/.vscode/extensions/…`), or
+- Run the extension from the "Extension Development Host" (open this folder in VS Code, hit F5 on the extension itself).
 
-1. `dotnet publish -c Release -r <your-rid> --self-contained false` on `../EmulatorDesktopApp/` and copies the output into `vendor/desktop-app/`. The extension always launches this bundled copy — no PATH configuration, no manual builds.
-2. Compiles the extension itself (`tsc`).
-3. Symlinks this folder into every VS Code / VS Code Insiders / VS Code OSS / Cursor extensions folder it finds on your machine.
+Configure the remote host in your **workspace** settings.json:
 
-Reload each editor once (⌘⇧P → **Developer: Reload Window**). The extension is then available in every window.
+```json
+{
+  "emulatorStreamRun.server": "ws://REMOTE.HOST:8080"
+}
+```
 
-**Prerequisites:** `dotnet` (10.0+) on `PATH`. That's the only extra tool — everything else is bundled.
+Now open **any workspace** — no Flutter, no pubspec required — and hit F5, or run `Emulator Stream: Run on remote device` from the command palette.
 
-## Use it
+## What F5 does end-to-end
 
-1. Start the gateway server (`websocket_nodejs/`) somewhere reachable.
-2. Open your Flutter project in VS Code (or Cursor). The workspace root — or any subfolder — must contain a `pubspec.yaml`.
-3. Either:
-   - Click **▶ Emulator Stream** in the status bar (bottom-left), **or**
-   - Command Palette → **Emulator Stream: Run Flutter on remote device**, **or**
-   - Press **F5** and pick *Emulator Stream* the first time (VS Code writes a minimal `launch.json` automatically).
-4. **Pick a flavor** from the Quick Pick (skipped if only one). See _Flavor discovery_ below.
-5. **Pick a device** from the Quick Pick. (Skipped if only one is available.)
-6. Watch the Debug Console — Flutter output streams in. When the app is ready, the streaming window opens beside your editor.
-7. Press **■ Stop** in the debug toolbar. Flutter quits, the streaming window closes, the server-side session is released.
+1. Opens a persistent WebSocket to the remote gateway server.
+2. `list_projects` → Quick Pick over remote projects (skipped if only one, or if pinned in `launch.json`).
+3. Quick Pick over flavors of the picked project (skipped if only one, or pinned).
+4. `get_devices` → Quick Pick over remote devices (in-use ones are filtered out).
+5. `create_session` — reserves the picked device on this WS.
+6. `run_flutter` — server spawns `flutter run -d <device> --target … --flavor …` **on the remote host**. Stdout/stderr streams back into the VS Code Debug Console as it arrives.
+7. When the server emits `flutter_ready`, launches the local `EmulatorDesktopApp` with `--session-id <sameSessionId>`.
+8. The streaming window connects to the remote server, calls `attach_session` to piggy-back on the reservation, negotiates WebRTC, and displays the live view.
+9. Touch/keyboard input in the streaming window is forwarded to the remote device.
 
-**No CLI to install. No `launch.json` to author. No paths to configure.**
+## Stop
 
-## Flavor discovery
+Click VS Code's Stop button, or close the streaming window. Both:
+1. Server sends `q` to the remote `flutter run` (graceful quit) → SIGTERM after `stopGracePeriodMs`.
+2. Extension SIGTERMs the local streaming window if it's still open.
+3. `destroy_session` releases the device on the remote.
 
-The extension automatically finds every way you already run your Flutter app and offers them all as picks.
+If the extension crashes, the server detects the WebSocket close and kills the remote Flutter subprocess automatically — no dangling `flutter run` processes.
 
-Sources, in order of preference:
+## `launch.json` reference
 
-1. **Existing `launch.json` entries** with `type: "dart"`. Their `program` becomes `--target`, their `--flavor` becomes `--flavor`, other args are forwarded verbatim.
-2. **`lib/main_*.dart` files** in your Flutter project. Everything after `main_` becomes the flavor name (`main_development.dart` → `development`).
-3. If neither exists, we just run `flutter run` with no flavor.
-
-You can reference a discovered flavor by name in an emulator-stream launch config with `configName`:
+The extension works without any `launch.json` — F5 in an empty workspace just prompts. If you want to pin things:
 
 ```jsonc
 {
   "type": "emulator-stream",
   "request": "launch",
-  "name": "Emulator Stream: development",
-  "configName": "development"
+  "name": "Emulator Stream",
+
+  "server":     "ws://REMOTE:8080",     // overrides emulatorStreamRun.server
+  "projectId":  "elm-employee-hub",     // skip project picker (id from flutter-projects.json)
+  "flavor":     "development",          // skip flavor picker (name from the flavors list)
+  "device":     "emulator-5554",        // skip device picker (id from get_devices)
+  "flutterArgs": ["--dart-define=STAGE=1"],
+  "openStreamWindow": true
 }
 ```
 
-Missing `target`/`flavor`/`flutterArgs` are filled in from the discovered flavor.
+## Extension settings
 
-## Settings
+| Setting | Default | Purpose |
+| ------- | ------- | ------- |
+| `emulatorStreamRun.server` | `ws://127.0.0.1:8080` | Remote gateway server URL. Prefer `127.0.0.1` on loopback (Node resolves `localhost` to IPv6 first). |
+| `emulatorStreamRun.desktopAppPath` | *(empty)* | Absolute path to the streaming viewer binary. Empty = use the copy bundled by `npm run bootstrap`. |
+| `emulatorStreamRun.openStreamWindow` | `true` | Open the streaming window on `flutter_ready`. |
+| `emulatorStreamRun.stopGracePeriodMs` | `5000` | Wait window for the remote Flutter to exit gracefully before SIGTERM. |
 
-| Setting                                | Default              | Notes                                                                                       |
-| -------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------- |
-| `emulatorStreamRun.server`             | `ws://127.0.0.1:8080`| Gateway server URL. Prefer `127.0.0.1` — Node 18+ resolves `localhost` to IPv6 first.       |
-| `emulatorStreamRun.desktopAppPath`     | *(bundled)*          | Advanced: absolute path to a custom `EmulatorDesktopApp` binary.                            |
-| `emulatorStreamRun.flutterPath`        | `flutter`            | Path to the flutter executable.                                                             |
-| `emulatorStreamRun.flutterProject`     | *(workspace root)*   | Path to the Flutter project. Empty = workspace root.                                        |
-| `emulatorStreamRun.openStreamWindow`   | `true`               | Set to `false` to run Flutter only (no streaming window).                                    |
-| `emulatorStreamRun.stopGracePeriodMs`  | `5000`               | How long to wait for Flutter's `q` before SIGTERM.                                          |
+Nothing about local Flutter paths, project paths, or flavor discovery — all of that lives on the remote host now.
 
-## Troubleshooting
+## Verifying the server side without a client
 
-- **`Could not fetch devices from ws://...`** — the gateway server isn't reachable. Check it's running and use `127.0.0.1` instead of `localhost` in the setting.
-- **`EmulatorDesktopApp binary not found`** — the bootstrap step skipped or failed. Run `npm run bootstrap` from the extension folder and check the `dotnet publish` output.
-- **`Device "X" was not returned by the server`** — the pinned device id in `launch.json` no longer matches. Remove it to get the Quick Pick, or update it to a currently online device.
-- **Streaming window is blank** — the Avalonia desktop app has its own log panel; open it (bottom tab in its window) to see connection/WebRTC/decoder messages. Everything server-side (session, ICE, frame stats) is logged there, not in the VS Code Debug Console.
-
-## Dev / testing
+Any WebSocket client can probe the new endpoints:
 
 ```bash
-npm run bootstrap             # (re-)publish desktop app + compile + symlink
-npm run compile               # tsc only
-node scripts/smoke-flavors.js # headless flavor-discovery test
+# Show configured projects
+wscat -c ws://REMOTE:8080
+> {"type":"list_projects","requestId":"a"}
+
+# Show devices with in_use annotations
+> {"type":"get_devices","requestId":"b"}
+```
+
+## Layout
+
+```
+vscode-emulator-run/
+├── src/
+│   ├── extension.ts        activation + commands + status bar
+│   ├── debugAdapter.ts     inline DAP adapter (F5 entry point)
+│   ├── orchestrator.ts     device→project→run_flutter→attach hand-off
+│   ├── serverClient.ts     long-lived WS client (all remote calls)
+│   ├── settings.ts         config resolution
+│   ├── devicePicker.ts     device Quick Pick
+│   ├── projectPicker.ts    project + flavor Quick Picks
+│   └── streamProcess.ts    spawn the local streaming viewer
+├── scripts/bootstrap.js    dotnet-publishes the viewer + symlinks the extension
+├── vendor/desktop-app/     (auto-generated) published viewer binary
+└── package.json
 ```

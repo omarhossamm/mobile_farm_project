@@ -127,9 +127,10 @@ namespace EmulatorDesktopApp.ViewModels
         /// requires that from the main thread. Every await here therefore
         /// resumes on Avalonia's UI SynchronizationContext.
         /// </summary>
-        public async Task AutoStartAsync(string server, string deviceId, CancellationToken ct = default)
+        public async Task AutoStartAsync(string server, string deviceId, string? attachSessionId = null, CancellationToken ct = default)
         {
-            AppendLog($"[auto] server={server} device={deviceId}");
+            AppendLog($"[auto] server={server} device={deviceId}"
+                + (string.IsNullOrEmpty(attachSessionId) ? "" : $" attach={attachSessionId}"));
             WebSocketUrl = server;
 
             // 1. Connect + wait for devices_list.
@@ -157,15 +158,39 @@ namespace EmulatorDesktopApp.ViewModels
             AppendLog($"[auto] step 2/4 → picked {picked.Id} ({picked.DisplayName})");
             SelectedDevice = picked;
 
-            // 3. Create session + wait for session_created.
-            AppendLog("[auto] step 3/4 → create session");
-            using (var sessionReady = WaitForNextEvent("session_created", TimeSpan.FromSeconds(30), ct))
+            // 3. Session: attach if the extension already reserved the
+            //    device on another WS, otherwise create our own.
+            //
+            //    Attach path (thin-client mode): the extension owns the
+            //    session on its WS and passes its id via --session-id.
+            //    We call attach_session so the server copies its
+            //    deviceId onto ours WITHOUT changing the reservation
+            //    owner — so if the streaming window is closed the
+            //    extension keeps holding the device.
+            if (!string.IsNullOrEmpty(attachSessionId))
             {
-                await ExecuteCreateSessionAsync();
-                if (!await sessionReady.Task)
+                AppendLog($"[auto] step 3/4 → attach to existing session {attachSessionId}");
+                using (var sessionReady = WaitForNextEvent("session_attached", TimeSpan.FromSeconds(15), ct))
                 {
-                    AppendLog("[auto] session_created not received in time");
-                    return;
+                    await ExecuteAttachSessionAsync(attachSessionId);
+                    if (!await sessionReady.Task)
+                    {
+                        AppendLog("[auto] session_attached not received in time");
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                AppendLog("[auto] step 3/4 → create session");
+                using (var sessionReady = WaitForNextEvent("session_created", TimeSpan.FromSeconds(30), ct))
+                {
+                    await ExecuteCreateSessionAsync();
+                    if (!await sessionReady.Task)
+                    {
+                        AppendLog("[auto] session_created not received in time");
+                        return;
+                    }
                 }
             }
 
@@ -173,6 +198,24 @@ namespace EmulatorDesktopApp.ViewModels
             AppendLog("[auto] step 4/4 → start stream");
             await ExecuteStartStreamAsync();
             AppendLog("[auto] handoff complete");
+        }
+
+        /// <summary>
+        /// Attach this WS to a session that another socket already
+        /// created. Server-side counterpart:
+        /// websocket_nodejs/adb-emulator-server/server.js → attach_session.
+        /// </summary>
+        private async Task ExecuteAttachSessionAsync(string targetSessionId)
+        {
+            var message = new
+            {
+                type = "attach_session",
+                session_id = targetSessionId,
+            };
+            var jsonMessage = JsonSerializer.Serialize(message);
+            var success = await _webSocketService.SendMessageAsync(jsonMessage);
+            if (!success)
+                AppendLog("[SESSION] Failed to send attach_session command");
         }
 
         /// <summary>
@@ -959,6 +1002,36 @@ namespace EmulatorDesktopApp.ViewModels
                             {
                                 SessionId = connectedSessionId;
                                 AppendLog($"[INFO] Server session: {SessionId}");
+                            }
+                        }
+
+                        // Handle session attached response — extension pre-reserved the
+                        // device on another WS and we're piggy-backing on it. The server
+                        // returns { attached_to, device_id, emulator_name }; we mirror the
+                        // effect of session_created locally without becoming the owner.
+                        if (msgType == "session_attached")
+                        {
+                            if (root.TryGetProperty("success", out var attachedSuccess) && !attachedSuccess.GetBoolean())
+                            {
+                                var errText = root.TryGetProperty("error", out var errEl) ? errEl.GetString() : "Unknown error";
+                                AppendLog($"[ERROR] attach_session failed: {errText}");
+                            }
+                            else if (ServerMessageJson.TryGetMessageData(root, out var attachData))
+                            {
+                                string? attachedTo = attachData.TryGetProperty("attached_to", out var aEl) ? aEl.GetString() : null;
+                                string? boundDeviceId = attachData.TryGetProperty("device_id", out var dEl) ? dEl.GetString() : null;
+                                string? emulatorName = attachData.TryGetProperty("emulator_name", out var eEl) ? eEl.GetString() : null;
+                                if (!string.IsNullOrEmpty(attachedTo))
+                                {
+                                    SessionId = attachedTo;
+                                    HasDeviceSession = true;
+                                    BindSessionDevice(boundDeviceId, emulatorName);
+                                    AppendLog($"[INFO] Attached to session {SessionId} (device {boundDeviceId})");
+                                    MarkDeviceOnline(boundDeviceId, emulatorName);
+                                    _pendingSelectDeviceId = boundDeviceId;
+                                    _ = ExecuteRefreshDevicesAsync();
+                                    (StartStreamCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                                }
                             }
                         }
 

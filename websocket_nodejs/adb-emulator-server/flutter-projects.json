@@ -1,0 +1,11 @@
+{
+  "$schema-hint": "One entry per Flutter project on THIS server host. Clients (VS Code extension) will see them in a Quick Pick. If `flavors` is omitted, the server auto-derives them from the project's .vscode/launch.json and lib/main_*.dart files.",
+  "projects": [
+    {
+      "id": "elm-employee-hub",
+      "name": "ELM Employee Hub",
+      "path": "/Users/ntg/Desktop/production/elm-employee-hub",
+      "flutterPath": "flutter"
+    }
+  ]
+}
