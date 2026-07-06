@@ -1,0 +1,192 @@
+{
+  "name": "vscode-emulator-run",
+  "displayName": "Emulator Stream Run",
+  "description": "Run a Flutter app on a remote emulator/simulator. Picks a device, runs `flutter run` locally, then launches the EmulatorDesktopApp to display the live stream. VS Code owns the lifecycle from the Run/Debug controls; the desktop app owns the streaming.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/pubspec.yaml",
+    "onDebugResolve:emulator-stream",
+    "onDebugDynamicConfigurations:emulator-stream",
+    "onCommand:emulatorStreamRun.pickDevice",
+    "onCommand:emulatorStreamRun.run"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "emulatorStreamRun.run",
+        "title": "Emulator Stream: Run Flutter on remote device",
+        "category": "Emulator Stream",
+        "icon": "$(play)"
+      },
+      {
+        "command": "emulatorStreamRun.pickDevice",
+        "title": "Emulator Stream: List devices",
+        "category": "Emulator Stream"
+      }
+    ],
+    "configuration": {
+      "title": "Emulator Stream",
+      "properties": {
+        "emulatorStreamRun.server": {
+          "type": "string",
+          "default": "ws://127.0.0.1:8080",
+          "description": "WebSocket URL of the emulator gateway server. (Prefer 127.0.0.1 over localhost — Node 18+ resolves 'localhost' to IPv6 first, which fails against IPv4-only servers.)"
+        },
+        "emulatorStreamRun.desktopAppPath": {
+          "type": "string",
+          "default": "",
+          "description": "Advanced: absolute path to the EmulatorDesktopApp binary. Leave empty to use the copy bundled with the extension (recommended)."
+        },
+        "emulatorStreamRun.flutterPath": {
+          "type": "string",
+          "default": "flutter",
+          "description": "Path to the flutter executable."
+        },
+        "emulatorStreamRun.flutterProject": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Flutter project (containing pubspec.yaml). Empty means use the workspace root."
+        },
+        "emulatorStreamRun.openStreamWindow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Launch the EmulatorDesktopApp streaming window when the app starts. Disable to only run Flutter locally without streaming."
+        },
+        "emulatorStreamRun.stopGracePeriodMs": {
+          "type": "number",
+          "default": 5000,
+          "description": "How long to wait for Flutter to exit gracefully after sending the 'q' quit command before SIGTERM."
+        }
+      }
+    },
+    "breakpoints": [
+      { "language": "dart" }
+    ],
+    "debuggers": [
+      {
+        "type": "emulator-stream",
+        "label": "Emulator Stream (Flutter + remote device)",
+        "languages": [
+          "dart"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "server": {
+                "type": "string",
+                "description": "WebSocket URL of the emulator gateway server (overrides emulatorStreamRun.server).",
+                "default": "ws://127.0.0.1:8080"
+              },
+              "device": {
+                "type": "string",
+                "description": "Device id to launch on. If omitted, a Quick Pick is shown. If exactly one device is available, it is auto-selected.",
+                "default": ""
+              },
+              "flutterProject": {
+                "type": "string",
+                "description": "Absolute path to the Flutter project (containing pubspec.yaml). Falls back to the workspace root.",
+                "default": ""
+              },
+              "target": {
+                "type": "string",
+                "description": "Passed to Flutter as --target (Dart entry point, e.g. lib/main_dev.dart).",
+                "default": ""
+              },
+              "flavor": {
+                "type": "string",
+                "description": "Passed to Flutter as --flavor.",
+                "default": ""
+              },
+              "flutterArgs": {
+                "type": "array",
+                "description": "Extra CLI args appended to `flutter run` (e.g. [\"--dart-define=FOO=bar\"]).",
+                "items": { "type": "string" },
+                "default": []
+              },
+              "openStreamWindow": {
+                "type": "boolean",
+                "description": "Launch the EmulatorDesktopApp after Flutter reports the app started.",
+                "default": true
+              },
+              "configName": {
+                "type": "string",
+                "description": "Reuse a Flutter flavor already defined in this workspace. Matches by name against `type: \"dart\"` configs in launch.json (and against lib/main_*.dart filenames). Missing target/flavor/args are inherited from the matched config."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "emulator-stream",
+            "request": "launch",
+            "name": "Emulator Stream: pick device",
+            "flutterProject": "${workspaceFolder}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Emulator Stream: pick device + flavor",
+            "description": "Prompts a flavor + device Quick Pick, runs Flutter, launches the streaming window.",
+            "body": {
+              "type": "emulator-stream",
+              "request": "launch",
+              "name": "Emulator Stream",
+              "flutterProject": "^\"\\${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "Emulator Stream: reuse a Dart flavor by name",
+            "description": "Inherits target/flavor/args from an existing `type: \"dart\"` config with the same name.",
+            "body": {
+              "type": "emulator-stream",
+              "request": "launch",
+              "name": "Emulator Stream: ^\"development\"",
+              "configName": "^\"development\"",
+              "flutterProject": "^\"\\${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "Emulator Stream: specific device + flavor",
+            "description": "Skip the pickers by pinning both a device id and a flavor.",
+            "body": {
+              "type": "emulator-stream",
+              "request": "launch",
+              "name": "Emulator Stream: ^\"<flavor>\"",
+              "device": "^\"<device-id>\"",
+              "flavor": "^\"<flavor>\"",
+              "target": "^\"lib/main_<flavor>.dart\"",
+              "flutterProject": "^\"\\${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "clean": "rm -rf out vendor",
+    "bootstrap": "node scripts/bootstrap.js",
+    "postinstall": "node scripts/bootstrap.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.5"
+  }
+}

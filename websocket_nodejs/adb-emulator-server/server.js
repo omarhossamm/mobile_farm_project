@@ -651,13 +651,36 @@ const messageHandlers = {
 
   /**
    * Get connected Android devices and emulators.
+   *
+   * Annotates each device with `in_use` + `owner_session_id` so clients
+   * can pre-flight the choice — a device that's already bound to a
+   * *live* session will refuse a `create_session` request, so surfacing
+   * that state up front lets the UI pick a different device instead of
+   * running an expensive build and only failing at the session step.
+   *
+   * A device is considered `in_use` iff there's an entry in
+   * `sessionManager.deviceToSession` AND that owning session's socket
+   * is still open. Dead sockets are ignored — they'd be auto-reclaimed
+   * by the next `create_session`.
    */
   get_devices: async (session, payload) => {
     const result = await platformHost.listDevices();
 
     if (result.success) {
+      const annotated = (result.devices || []).map((device) => {
+        const owner = device && device.device_id
+          ? sessionManager.getSessionByDevice(device.device_id)
+          : null;
+        const ownerAlive = !!(owner && owner.ws && owner.ws.readyState === owner.ws.OPEN);
+        const ownedByMe = ownerAlive && owner.id === session.id;
+        return {
+          ...device,
+          in_use: ownerAlive && !ownedByMe,
+          owner_session_id: ownerAlive ? owner.id : null,
+        };
+      });
       session.sendSuccess('devices_list', {
-        devices: result.devices,
+        devices: annotated,
         avd_list_error: result.avd_list_error
       }, payload.requestId);
     } else {

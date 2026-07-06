@@ -93,6 +93,15 @@ public partial class MainWindow : Window
 
         if (_viewModel != null)
             _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+
+        // Extension-driven launch: run the whole connect/pick/stream
+        // chain automatically. Falls back to the classic manual UI when
+        // no --auto-start flag was passed.
+        var opts = LaunchOptions.Current;
+        if (_viewModel != null && opts.AutoStart && !string.IsNullOrWhiteSpace(opts.Server) && !string.IsNullOrWhiteSpace(opts.DeviceId))
+        {
+            _ = _viewModel.AutoStartAsync(opts.Server!, opts.DeviceId!);
+        }
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)

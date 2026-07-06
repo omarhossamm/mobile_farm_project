@@ -1,6 +1,8 @@
 using Avalonia;
 using Avalonia.Threading;
 using System.Threading;
+using System.Collections.Specialized;
+using System.Linq;
 using EmulatorDesktopApp.Services;
 using EmulatorDesktopApp.Streaming;
 using EmulatorDesktopApp.ViewModels.Commands;
@@ -108,6 +110,120 @@ namespace EmulatorDesktopApp.ViewModels
             // Add initial log message
             AppendLog("Application started. Enter WebSocket URL and click Connect.");
         }
+
+        /// <summary>
+        /// Runs the full manual flow (Connect → Refresh Devices → Select →
+        /// Create Session → Start Stream) unattended. Used when the app
+        /// is launched by the VS Code / Cursor extension with
+        /// <c>--server</c>, <c>--device</c>, and <c>--auto-start</c>.
+        /// </summary>
+        /// <summary>
+        /// Extension-driven launch. Waits for each protocol event (devices_list,
+        /// session_created) instead of polling the ViewModel's property state.
+        ///
+        /// Threading: this method deliberately does NOT use ConfigureAwait(false).
+        /// It must stay on the UI thread because ExecuteStartStreamAsync ends up
+        /// invoking `OpenStreamWindow`, which creates an NSWindow — Avalonia
+        /// requires that from the main thread. Every await here therefore
+        /// resumes on Avalonia's UI SynchronizationContext.
+        /// </summary>
+        public async Task AutoStartAsync(string server, string deviceId, CancellationToken ct = default)
+        {
+            AppendLog($"[auto] server={server} device={deviceId}");
+            WebSocketUrl = server;
+
+            // 1. Connect + wait for devices_list.
+            AppendLog("[auto] step 1/4 → connect");
+            using (var devicesReady = WaitForNextEvent("devices_list", TimeSpan.FromSeconds(15), ct))
+            {
+                await ExecuteConnectAsync();
+                if (!IsConnected) { AppendLog("[auto] connect failed"); return; }
+                if (!await devicesReady.Task)
+                {
+                    AppendLog("[auto] devices_list not received in time");
+                    return;
+                }
+            }
+
+            // 2. Match device id / avd name.
+            var picked = Devices.FirstOrDefault(d =>
+                string.Equals(d.Id, deviceId, StringComparison.Ordinal) ||
+                string.Equals(d.AvdName, deviceId, StringComparison.Ordinal));
+            if (picked == null)
+            {
+                AppendLog($"[auto] device '{deviceId}' not in server list — visible: {string.Join(", ", Devices.Select(d => d.Id))}");
+                return;
+            }
+            AppendLog($"[auto] step 2/4 → picked {picked.Id} ({picked.DisplayName})");
+            SelectedDevice = picked;
+
+            // 3. Create session + wait for session_created.
+            AppendLog("[auto] step 3/4 → create session");
+            using (var sessionReady = WaitForNextEvent("session_created", TimeSpan.FromSeconds(30), ct))
+            {
+                await ExecuteCreateSessionAsync();
+                if (!await sessionReady.Task)
+                {
+                    AppendLog("[auto] session_created not received in time");
+                    return;
+                }
+            }
+
+            // 4. Start stream. From here on the WebRTC pipeline drives itself.
+            AppendLog("[auto] step 4/4 → start stream");
+            await ExecuteStartStreamAsync();
+            AppendLog("[auto] handoff complete");
+        }
+
+        /// <summary>
+        /// Awaitable one-shot server-message event listener. Disposes cleanly
+        /// on timeout or explicit disposal so the ViewModel isn't left with
+        /// leaked callbacks.
+        /// </summary>
+        private ServerEventAwaiter WaitForNextEvent(string msgType, TimeSpan timeout, CancellationToken ct) =>
+            new(this, msgType, timeout, ct);
+
+        private sealed class ServerEventAwaiter : IDisposable
+        {
+            private readonly MainWindowViewModel _vm;
+            private readonly string _msgType;
+            private readonly TaskCompletionSource<bool> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly System.Threading.Timer _timer;
+            private readonly CancellationTokenRegistration _reg;
+
+            public Task<bool> Task => _tcs.Task;
+
+            public ServerEventAwaiter(MainWindowViewModel vm, string msgType, TimeSpan timeout, CancellationToken ct)
+            {
+                _vm = vm;
+                _msgType = msgType;
+                vm._serverMessageObservers += OnMessage;
+                _timer = new System.Threading.Timer(_ => _tcs.TrySetResult(false), null, timeout, System.Threading.Timeout.InfiniteTimeSpan);
+                _reg = ct.Register(() => _tcs.TrySetResult(false));
+            }
+
+            private void OnMessage(string msgType)
+            {
+                if (msgType == _msgType) _tcs.TrySetResult(true);
+            }
+
+            public void Dispose()
+            {
+                _vm._serverMessageObservers -= OnMessage;
+                _timer.Dispose();
+                _reg.Dispose();
+                _tcs.TrySetResult(false);
+            }
+        }
+
+        /// <summary>
+        /// Fired for every parsed server message so ServerEventAwaiter can
+        /// resolve its Task. Subscribed only by the auto-start machinery;
+        /// zero cost otherwise.
+        /// </summary>
+        private event Action<string>? _serverMessageObservers;
+
+        private void NotifyServerMessage(string msgType) => _serverMessageObservers?.Invoke(msgType);
 
         #endregion
 
@@ -1093,6 +1209,11 @@ namespace EmulatorDesktopApp.ViewModels
                             AppendLog($"[STREAM ERROR] {errorText}");
                             StreamStatus = "Error";
                         }
+
+                        // Notify auto-start observers *after* the message-specific
+                        // handlers ran, so continuations that inspect Devices /
+                        // SessionId / StreamStatus see the post-mutation state.
+                        if (msgType != null) NotifyServerMessage(msgType);
                     }
 
                     // Echo the raw payload (capped). Skip types that already have
