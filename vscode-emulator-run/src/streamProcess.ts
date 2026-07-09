@@ -1,5 +1,8 @@
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 /**
  * Launches the EmulatorDesktopApp as a child process with the
@@ -35,6 +38,51 @@ export class StreamProcess extends EventEmitter {
     }
 
     this.emit('output', `[stream] $ ${opts.desktopAppPath} ${args.join(' ')}\n`, 'stdout');
+    // The binary's mtime is the fastest way to answer "is this the
+    // build I just rebuilt or a stale one from last week?". Print it
+    // alongside the path so users can eyeball it against source edits
+    // — the freshness helper in the orchestrator already warns loudly
+    // when it doesn't advertise the required feature tags, but the
+    // mtime is a nice extra sanity check on top.
+    try {
+      const st = fs.statSync(opts.desktopAppPath);
+      this.emit(
+        'output',
+        `[stream] binary mtime: ${st.mtime.toISOString()} size=${st.size} bytes\n`,
+        'stdout'
+      );
+      // On Unix, some vsix unpackers (particularly older VS Code /
+      // Cursor builds) don't preserve the executable bit when they
+      // extract the .vsix zip. The next `spawn` call would fail with
+      // EACCES for what looks like a totally healthy binary — very
+      // confusing. Defensively re-add u+x if the bit is missing.
+      if (process.platform !== 'win32' && (st.mode & 0o100) === 0) {
+        try {
+          fs.chmodSync(opts.desktopAppPath, st.mode | 0o755);
+          this.emit(
+            'output',
+            `[stream] restored executable bit on ${opts.desktopAppPath}\n`,
+            'stdout'
+          );
+        } catch (chmodErr) {
+          this.emit(
+            'output',
+            `[stream] warning: could not chmod +x ${opts.desktopAppPath}: ${
+              chmodErr instanceof Error ? chmodErr.message : String(chmodErr)
+            }\n`,
+            'stderr'
+          );
+        }
+      }
+    } catch { /* stat failure isn't fatal — spawn will report the real error */ }
+    // Windows WinExe apps detach stdout, so the desktop app writes a
+    // parallel diagnostic log to os.tmpdir(). Print the path so users
+    // don't have to hunt for it after a bad launch.
+    this.emit(
+      'output',
+      `[stream] startup log: ${path.join(os.tmpdir(), 'EmulatorDesktopApp.log')}\n`,
+      'stdout'
+    );
 
     this.child = spawn(opts.desktopAppPath, args, {
       stdio: ['ignore', 'pipe', 'pipe'],

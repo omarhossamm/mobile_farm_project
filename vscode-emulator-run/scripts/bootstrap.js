@@ -35,8 +35,15 @@ if (process.env.EMULATOR_STREAM_SKIP_BOOTSTRAP === '1') {
 
 const extensionRoot = path.resolve(__dirname, '..');
 const siblingDesktopApp = path.resolve(extensionRoot, '..', 'EmulatorDesktopApp');
-const vendorDesktopDir = path.join(extensionRoot, 'vendor', 'desktop-app');
+const vendorRoot = path.join(extensionRoot, 'vendor', 'desktop-app');
 const targetFramework = readTargetFramework(siblingDesktopApp);
+
+// Bump this every time we change how the extension talks to the desktop app
+// (new CLI flag, new WS protocol event, new headless behaviour, etc.). The
+// extension asserts the running binary was built with the SAME contract by
+// reading vendor/desktop-app/BUILD_INFO.json → features. See
+// src/desktopAppFreshness.ts on the extension side.
+const REQUIRED_DESKTOP_APP_FEATURES = ['headless-attach-v1'];
 
 step(`Publish EmulatorDesktopApp for this platform (${targetFramework ?? '?'})`, () => {
   if (!fs.existsSync(siblingDesktopApp)) {
@@ -48,6 +55,8 @@ step(`Publish EmulatorDesktopApp for this platform (${targetFramework ?? '?'})`,
   if (!targetFramework) {
     fatal('Could not read <TargetFramework> from EmulatorDesktopApp.csproj');
   }
+  // Match production packaging: flat vendor/desktop-app/ with only this
+  // platform's publish output (EmulatorDesktopApp[.exe], native libs, …).
   const rid = detectDotnetRid();
   log(`publishing for ${rid}…`);
   execFileSync(
@@ -59,10 +68,20 @@ step(`Publish EmulatorDesktopApp for this platform (${targetFramework ?? '?'})`,
   if (!fs.existsSync(publishDir)) {
     fatal(`publish output missing at ${publishDir}`);
   }
-  fs.rmSync(vendorDesktopDir, { recursive: true, force: true });
-  fs.mkdirSync(vendorDesktopDir, { recursive: true });
-  copyRecursive(publishDir, vendorDesktopDir);
-  log(`bundled desktop app → ${vendorDesktopDir}`);
+  if (rid === 'win-x64' || rid === 'win-arm64') {
+    const { ensureWinFfmpegInPublishDir, hasWinFfmpeg } = require('./ensure-win-ffmpeg');
+    ensureWinFfmpegInPublishDir(publishDir);
+    if (!hasWinFfmpeg(publishDir)) {
+      fatal(`Windows FFmpeg DLLs missing in ${publishDir}/ffmpeg/win-x64`);
+    }
+  }
+  const { prunePublishDir } = require('./prune-publish');
+  prunePublishDir(publishDir, rid);
+  fs.rmSync(vendorRoot, { recursive: true, force: true });
+  fs.mkdirSync(vendorRoot, { recursive: true });
+  copyRecursive(publishDir, vendorRoot);
+  writeBuildInfo(vendorRoot, rid);
+  log(`bundled desktop app → ${vendorRoot}`);
 });
 
 step('Compile extension', () => {
@@ -150,6 +169,53 @@ function detectDotnetRid() {
  * Read the <TargetFramework> from the .csproj so we don't hardcode
  * `net10.0` and silently break on upgrades.
  */
+/**
+ * Emit a BUILD_INFO.json next to the desktop-app binary. This is how the
+ * extension knows the bundle was rebuilt after a code change: at spawn time
+ * it reads this file and asserts every entry in
+ * `REQUIRED_DESKTOP_APP_FEATURES` is listed under `features`. Missing file
+ * or missing feature ⇒ stale bundle warning + one-click rebuild prompt.
+ */
+function writeBuildInfo(dir, rid) {
+  let gitSha = null;
+  try {
+    gitSha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+      cwd: extensionRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch { /* not a git repo or git missing — that's fine, still emit the file */ }
+  const info = {
+    builtAt: new Date().toISOString(),
+    rid,
+    gitSha,
+    features: REQUIRED_DESKTOP_APP_FEATURES.slice(),
+    nodeVersion: process.version,
+    platform: `${process.platform}/${process.arch}`,
+  };
+  fs.writeFileSync(path.join(dir, 'BUILD_INFO.json'), JSON.stringify(info, null, 2) + '\n');
+}
+
+/**
+ * Emit vendor/desktop-app/SUPPORTED_RIDS.json — the top-level
+ * manifest the extension consults to know which platforms this
+ * install ships binaries for. In dev mode we only ship the current
+ * host's RID; the production `scripts/package.js` writes a fatter
+ * manifest with every RID it built.
+ */
+function writeSupportedRidsManifest(builds) {
+  const manifest = {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    rids: builds.map((b) => ({
+      rid: b.rid,
+      features: b.features,
+    })),
+  };
+  fs.writeFileSync(
+    path.join(vendorRoot, 'SUPPORTED_RIDS.json'),
+    JSON.stringify(manifest, null, 2) + '\n'
+  );
+}
+
 function readTargetFramework(desktopAppDir) {
   const csproj = path.join(desktopAppDir, 'EmulatorDesktopApp.csproj');
   try {

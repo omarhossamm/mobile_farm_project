@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const projectRegistry = require('./projectRegistry');
+const sessionWorkspace = require('./sessionWorkspace');
 
 const logger = {
   info:  (m, d = {}) => console.log (`[FLUTTER][INFO]  ${new Date().toISOString()} - ${m}`, Object.keys(d).length ? d : ''),
@@ -53,12 +54,19 @@ const VM_SERVICE_MARKERS = [
 /**
  * One flutter subprocess. Owns the child + the parsing state; the
  * FlutterRunnerService coordinates them across sessions.
+ *
+ * `project.path` is the *effective* cwd — for an isolated workspace
+ * that's the snapshot, not the origin. `originPath` is kept
+ * alongside purely for observability (logs + response) so the
+ * client can trace back to the folder they asked for.
  */
 class FlutterRun {
-  constructor({ runId, session, project, flavor, deviceId, extraArgs = [] }) {
+  constructor({ runId, session, project, originPath, isolated, flavor, deviceId, extraArgs = [] }) {
     this.runId = runId;
     this.session = session;
     this.project = project;
+    this.originPath = originPath ?? project.path;
+    this.isolated = !!isolated;
     this.flavor = flavor;
     this.deviceId = deviceId;
     this.extraArgs = extraArgs;
@@ -76,7 +84,23 @@ class FlutterRun {
 
     const cmd = this.project.flutterPath || 'flutter';
     const cwd = this.project.path;
-    logger.info('spawn flutter', { runId: this.runId, sessionId: this.session.id, cmd, args, cwd });
+    logger.info('spawn flutter', {
+      runId: this.runId, sessionId: this.session.id, cmd, args, cwd,
+      origin: this.originPath, isolated: this.isolated,
+    });
+
+    // Surface the isolation state to the client on the same output
+    // channel it reads flutter's stdout from — no protocol change
+    // required, just an extra informational line. Clients that
+    // don't render it lose nothing.
+    if (this.isolated) {
+      this.session.send({
+        type: 'flutter_output',
+        runId: this.runId,
+        stream: 'stdout',
+        line: `[server] isolated workspace: ${cwd}\n[server] origin: ${this.originPath}\n`,
+      });
+    }
 
     this.child = spawn(cmd, args, {
       cwd,
@@ -91,6 +115,8 @@ class FlutterRun {
       deviceId: this.deviceId,
       cmd: `${cmd} ${args.join(' ')}`,
       cwd,
+      originPath: this.originPath,
+      isolated: this.isolated,
     });
 
     this.child.stdout.on('data', (b) => this._onChunk(b, 'stdout'));
@@ -226,6 +252,52 @@ function _removeRun(runId, sessionId) {
 }
 
 /**
+ * Turn a per-project `workspace` override (from
+ * flutter-projects.json) into the opts shape sessionWorkspace.prepare
+ * expects. Keeps only recognised fields so a typo can't accidentally
+ * silence our defaults.
+ */
+function _resolveWorkspaceOpts(perProject) {
+  if (!perProject || typeof perProject !== 'object') return {};
+  const opts = {};
+  if (perProject.mode === 'copy' || perProject.mode === 'shared') opts.mode = perProject.mode;
+  if (Array.isArray(perProject.excludeDirs))  opts.excludeDirs  = perProject.excludeDirs;
+  if (Array.isArray(perProject.excludeFiles)) opts.excludeFiles = perProject.excludeFiles;
+  return opts;
+}
+
+/**
+ * Resolve a project from either its registry id OR a raw filesystem
+ * path (ad-hoc — supplied dynamically by the client). Exactly one of
+ * the two must be provided. Returns `{ project }` on success or
+ * `{ error }` with a human-readable reason on failure.
+ */
+function _resolveProject({ projectId, projectPath, flutterPath }) {
+  if (projectId && projectPath) {
+    return { error: 'Pass either projectId or projectPath, not both' };
+  }
+  if (projectId) {
+    const project = projectRegistry.getProject(projectId);
+    if (!project) {
+      return {
+        error: `Unknown project "${projectId}". Configure it in flutter-projects.json on the server, ` +
+               `or pass "projectPath" directly to run any Flutter checkout without editing the config.`,
+      };
+    }
+    if (!fs.existsSync(path.join(project.path, 'pubspec.yaml'))) {
+      return { error: `Project "${projectId}" points at ${project.path} but no pubspec.yaml is there.` };
+    }
+    return { project };
+  }
+  if (projectPath) {
+    const built = projectRegistry.buildAdHocProject(projectPath, flutterPath);
+    if (!built.ok) return { error: built.error };
+    return { project: built.project };
+  }
+  return { error: 'One of projectId or projectPath is required' };
+}
+
+/**
  * WS handler exports — plug straight into server.js messageHandlers.
  */
 module.exports = {
@@ -234,38 +306,95 @@ module.exports = {
     session.sendSuccess('projects_list', { projects }, payload.requestId);
   },
 
-  run_flutter: async (session, payload) => {
-    const { projectId, flavorName = null, deviceId, extraArgs = [] } = payload || {};
-    if (!projectId) return session.sendError('run_flutter', 'projectId is required', payload?.requestId);
-    if (!deviceId)  return session.sendError('run_flutter', 'deviceId is required',  payload?.requestId);
+  /**
+   * Discover flavors for a caller-supplied projectPath. Used by the
+   * extension when the user pins `emulatorStreamRun.projectPath`
+   * (or the `projectPath` launch.json field) instead of picking from
+   * flutter-projects.json — we still need a flavor list to drive the
+   * Quick Pick.
+   */
+  list_flavors: async (session, payload) => {
+    const { projectPath, flutterPath = null } = payload || {};
+    const built = projectRegistry.buildAdHocProject(projectPath, flutterPath);
+    if (!built.ok) return session.sendError('list_flavors', built.error, payload?.requestId);
+    session.sendSuccess(
+      'flavors_list',
+      {
+        projectPath: built.project.path,
+        name: built.project.name,
+        flavors: built.project.flavors.map(projectRegistry.publicFlavor),
+      },
+      payload?.requestId
+    );
+  },
 
-    const project = projectRegistry.getProject(projectId);
-    if (!project) {
-      return session.sendError(
-        'run_flutter',
-        `Unknown project "${projectId}". Configure it in flutter-projects.json on the server.`,
-        payload?.requestId
-      );
-    }
-    if (!fs.existsSync(path.join(project.path, 'pubspec.yaml'))) {
-      return session.sendError(
-        'run_flutter',
-        `Project "${projectId}" points at ${project.path} but no pubspec.yaml is there.`,
-        payload?.requestId
-      );
-    }
-    const flavor = flavorName ? projectRegistry.getFlavor(projectId, flavorName) : null;
+  run_flutter: async (session, payload) => {
+    const {
+      projectId = null,
+      projectPath = null,
+      flutterPath = null,
+      flavorName = null,
+      deviceId,
+      extraArgs = [],
+    } = payload || {};
+    if (!deviceId) return session.sendError('run_flutter', 'deviceId is required', payload?.requestId);
+
+    const resolved = _resolveProject({ projectId, projectPath, flutterPath });
+    if (resolved.error) return session.sendError('run_flutter', resolved.error, payload?.requestId);
+    const project = resolved.project;
+
+    // Flavor lookup: registered projects search their configured
+    // flavor list; ad-hoc projects use whatever the discovery
+    // heuristic found (same list, resolved during buildAdHocProject).
+    const flavor = flavorName
+      ? project.flavors.find((f) => f.name === flavorName) ?? null
+      : null;
     if (flavorName && !flavor) {
       return session.sendError(
         'run_flutter',
-        `Flavor "${flavorName}" not found in project "${projectId}". ` +
+        `Flavor "${flavorName}" not found for project at ${project.path}. ` +
         `Known: ${project.flavors.map((f) => f.name).join(', ') || '(none)'}`,
         payload?.requestId
       );
     }
 
+    // Isolated workspace — this is the heart of the "concurrent
+    // developers" fix. `project.workspace` (from flutter-projects.json
+    // per-project override) wins over the global default. `flutter run`
+    // then executes with cwd = the snapshot, so its build state cannot
+    // touch either the origin or any other session's snapshot.
+    let workspaceInfo;
+    try {
+      workspaceInfo = await sessionWorkspace.get().prepare(
+        session.id,
+        project.path,
+        _resolveWorkspaceOpts(project.workspace)
+      );
+    } catch (err) {
+      logger.error('workspace prepare failed', { sessionId: session.id, error: err.message });
+      return session.sendError(
+        'run_flutter',
+        `Could not prepare isolated workspace: ${err.message}`,
+        payload?.requestId
+      );
+    }
+
+    // Substitute the effective cwd. Everything downstream (spawn,
+    // events, response) operates on this projected view of the
+    // project; `originPath` is carried separately for logs.
+    const effectiveProject = { ...project, path: workspaceInfo.workspacePath };
+
     const runId = _newRunId();
-    const run = new FlutterRun({ runId, session, project, flavor, deviceId, extraArgs });
+    const run = new FlutterRun({
+      runId,
+      session,
+      project: effectiveProject,
+      originPath: project.path,
+      isolated: workspaceInfo.isolated,
+      flavor,
+      deviceId,
+      extraArgs,
+    });
     _addRun(run);
 
     // Auto-cleanup when the process exits — remove from registries so
@@ -273,7 +402,23 @@ module.exports = {
     const originalOnExit = () => _removeRun(runId, session.id);
     run.constructor.prototype._removeSelfOnExit = originalOnExit;
 
-    session.sendSuccess('run_flutter', { runId, projectId, deviceId, flavor: flavor?.name ?? null }, payload?.requestId);
+    // Backwards-compatible response: `projectPath` is still what the
+    // client asked for (origin, or the registered project's path).
+    // `workspacePath` + `workspaceIsolated` are additive fields
+    // older clients silently ignore.
+    session.sendSuccess(
+      'run_flutter',
+      {
+        runId,
+        projectId: project.id,
+        projectPath: project.path,
+        workspacePath: workspaceInfo.isolated ? workspaceInfo.workspacePath : null,
+        workspaceIsolated: workspaceInfo.isolated,
+        deviceId,
+        flavor: flavor?.name ?? null,
+      },
+      payload?.requestId
+    );
     run.start();
   },
 
@@ -305,19 +450,32 @@ module.exports = {
   /**
    * Session-close hook — called from the WS 'close' handler in
    * server.js so a dead extension doesn't leave `flutter run`
-   * subprocesses running on the remote.
+   * subprocesses running on the remote OR isolated workspaces
+   * eating disk after the session that owned them is gone.
+   *
+   * Order matters: kill flutter FIRST, then rm the workspace. If we
+   * remove the workspace while flutter still holds file handles
+   * inside it we'd get racy rm errors (esp. on Windows).
    */
   handleSessionClose: async (sessionId) => {
     const ids = runIdsBySessionId.get(sessionId);
-    if (!ids || ids.size === 0) return;
-    logger.info('cleaning up flutter runs for closed session', { sessionId, count: ids.size });
-    for (const runId of Array.from(ids)) {
-      const run = runsByRunId.get(runId);
-      if (run) {
-        try { await run.stop({ gracePeriodMs: 2000 }); }
-        catch (err) { logger.warn('stop failed during cleanup', { runId, error: err.message }); }
+    if (ids && ids.size > 0) {
+      logger.info('cleaning up flutter runs for closed session', { sessionId, count: ids.size });
+      for (const runId of Array.from(ids)) {
+        const run = runsByRunId.get(runId);
+        if (run) {
+          try { await run.stop({ gracePeriodMs: 2000 }); }
+          catch (err) { logger.warn('stop failed during cleanup', { runId, error: err.message }); }
+        }
+        _removeRun(runId, sessionId);
       }
-      _removeRun(runId, sessionId);
+    }
+    // Always attempt workspace release, even if there were no active
+    // runs — a `run_flutter` that failed after prepare() but before
+    // spawn would still leave a snapshot behind otherwise.
+    try { await sessionWorkspace.get().release(sessionId); }
+    catch (err) {
+      logger.warn('workspace release failed on session close', { sessionId, error: err.message });
     }
   },
 };

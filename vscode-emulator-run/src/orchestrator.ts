@@ -1,10 +1,26 @@
 import { EventEmitter } from 'events';
 import * as vscode from 'vscode';
-import { ServerClient, type DeviceEntry, type ProjectFlavor, type ProjectEntry, type RunHandle } from './serverClient';
+import { ServerClient, type DeviceEntry, type ProjectFlavor, type RunHandle } from './serverClient';
 import { pickDevice, UserCancelled, DeviceInUseError } from './devicePicker';
-import { pickProjectAndFlavor } from './projectPicker';
+import { pickProjectAndFlavor, pickFlavorFromList } from './projectPicker';
 import { StreamProcess } from './streamProcess';
-import type { ResolvedSettings } from './settings';
+import { buildInfoForResolvedSource, type ResolvedSettings } from './settings';
+import { formatBuildInfoLine, formatDiagnosticsReport, isStale, stalenessReason } from './desktopAppFreshness';
+import { REBUILD_COMMAND } from './rebuildCommand';
+import { DesktopAppInstaller, InstallerError, type ProgressReporter, type ResolvedSource } from './desktopAppInstaller';
+
+/**
+ * Concrete "what to run" record produced by {@link Orchestrator.resolveRemoteProject}.
+ * Exactly one of `projectId` / `projectPath` is set; both feed into
+ * `runFlutter` on the server.
+ */
+interface ResolvedRun {
+  projectId?: string;
+  projectPath?: string;
+  flutterPath?: string;
+  displayName: string;
+  flavor: ProjectFlavor | null;
+}
 
 /**
  * Thin-client orchestrator.
@@ -38,6 +54,18 @@ export interface OrchestratorEvents {
 
 type LastChoiceStore = vscode.Memento | undefined;
 
+/**
+ * Everything the orchestrator needs to resolve the desktop app binary
+ * (either from the shipped bundle, the on-disk cache, or by
+ * downloading). Kept as its own type so callers can pass it in without
+ * needing the full `vscode.ExtensionContext`.
+ */
+export interface DesktopAppEnvironment {
+  extensionRoot: string;
+  cacheRoot: string;
+  installer: DesktopAppInstaller;
+}
+
 export class Orchestrator extends EventEmitter {
   private client: ServerClient | null = null;
   private stream: StreamProcess | null = null;
@@ -48,11 +76,14 @@ export class Orchestrator extends EventEmitter {
   private appReady = false;
   private workspaceKey: string;
   private lastChoiceStore: LastChoiceStore;
+  private desktopEnv: DesktopAppEnvironment | undefined;
+  private resolvedDesktopApp: ResolvedSource | null = null;
 
-  constructor(workspaceKey: string, lastChoiceStore: LastChoiceStore) {
+  constructor(workspaceKey: string, lastChoiceStore: LastChoiceStore, desktopEnv?: DesktopAppEnvironment) {
     super();
     this.workspaceKey = workspaceKey;
     this.lastChoiceStore = lastChoiceStore;
+    this.desktopEnv = desktopEnv;
   }
 
   async start(settings: ResolvedSettings): Promise<void> {
@@ -94,10 +125,14 @@ export class Orchestrator extends EventEmitter {
     this.device = device;
 
     // ── 2. Project + flavor ───────────────────────────────────────────
-    this.emitStatus('Fetching remote projects…');
-    const projects = await client.fetchProjects();
-    const { project, flavor } = await this.resolveProject(projects, settings);
-    if (!project) return;
+    //   Two branches:
+    //     a. Ad-hoc projectPath (setting or launch.json) — skip the
+    //        registered-project list entirely; the server discovers
+    //        flavors for that path via `list_flavors`.
+    //     b. Registered project — the classic flow: `list_projects`
+    //        → Quick Pick over projects → Quick Pick over flavors.
+    const resolved = await this.resolveRemoteProject(client, settings);
+    if (!resolved) return;
 
     // ── 3. Reserve device on this WS ──────────────────────────────────
     this.emitStatus(`Reserving device ${device.device_id}…`);
@@ -105,30 +140,143 @@ export class Orchestrator extends EventEmitter {
     this.emitLine(`[extension] session created: ${sessionId}\n`, 'console');
 
     // ── 4. Run flutter on the remote host ─────────────────────────────
-    this.emitStatus(`Running ${project.name}${flavor ? ` (${flavor.name})` : ''} on remote…`);
+    this.emitStatus(`Running ${resolved.displayName}${resolved.flavor ? ` (${resolved.flavor.name})` : ''} on remote…`);
     this.runHandle = await client.runFlutter({
-      projectId: project.id,
-      flavorName: flavor?.name,
+      projectId: resolved.projectId,
+      projectPath: resolved.projectPath,
+      flutterPath: resolved.flutterPath,
+      flavorName: resolved.flavor?.name,
       deviceId: device.device_id,
       extraArgs: settings.flutterArgs,
     });
-    this.emitLine(`[extension] remote runId=${this.runHandle.runId}\n`, 'console');
+    this.emitLine(
+      `[extension] remote runId=${this.runHandle.runId} path=${this.runHandle.projectPath || this.runHandle.projectId}\n`,
+      'console'
+    );
 
     // ── 5. Wait for the app to actually start on the device ──────────
     if (settings.openStreamWindow) {
       this.emitStatus('Waiting for Flutter to start on device…');
       await this.waitForAppReady(180_000);
-      if (!settings.desktopAppPath) {
-        throw new Error(
-          'EmulatorDesktopApp binary not found. Run `npm run bootstrap` in the extension folder ' +
-          'or set `emulatorStreamRun.desktopAppPath`.'
-        );
-      }
+
+      // Ensure a runnable desktop-app binary exists on this machine.
+      // This is the first (and only) time we ever touch the network
+      // in the F5 path: on a fresh install we'll download+extract
+      // the pinned archive; on subsequent runs we hit the local cache
+      // in a few milliseconds.
+      const resolvedApp = await this.ensureDesktopApp(settings);
+      const info = buildInfoForResolvedSource(resolvedApp.path, resolvedApp.kind, settings.desktopApp);
+      this.reportDesktopAppFreshness(info, resolvedApp);
+
       this.emitStatus('Opening stream window…');
-      this.spawnStream(settings, sessionId);
+      this.spawnStream(settings, sessionId, resolvedApp.path);
     }
 
     this.emitStatus('Running');
+  }
+
+  /**
+   * Make a runnable EmulatorDesktopApp available on this host — from
+   * user override, shipped bundle, cache, or by downloading. Wraps the
+   * download in `vscode.window.withProgress` so the user sees a
+   * cancellable spinner during first-run installs (usually seconds on
+   * broadband; the progress bar keeps them from thinking the extension
+   * hung).
+   */
+  private async ensureDesktopApp(settings: ResolvedSettings): Promise<ResolvedSource> {
+    if (this.resolvedDesktopApp) return this.resolvedDesktopApp;
+
+    if (!this.desktopEnv) {
+      // Old callers (e.g. tests) that constructed Orchestrator without
+      // an installer environment fall back to the sync path: any
+      // resolution the preliminary settings already made is used
+      // as-is; nothing downloads.
+      if (!settings.desktopApp.path) {
+        this.emitLine(`[extension] ${formatDiagnosticsReport(settings.desktopApp)}\n`, 'stderr');
+        throw new Error(stalenessReason(settings.desktopApp) ||
+          'Desktop app is missing and no installer was configured for this Orchestrator instance.');
+      }
+      this.resolvedDesktopApp = { kind: settings.desktopApp.origin === 'user-setting' ? 'user-setting' : 'bundled', path: settings.desktopApp.path } as ResolvedSource;
+      return this.resolvedDesktopApp;
+    }
+
+    try {
+      const resolved = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Emulator Stream: preparing streaming viewer',
+          cancellable: true,
+        },
+        async (progress, token) => {
+          const reporter: ProgressReporter = ({ phase, bytes, totalBytes, message }) => {
+            if (phase === 'downloading' && totalBytes) {
+              const pct = totalBytes > 0 ? Math.round(((bytes ?? 0) / totalBytes) * 100) : 0;
+              progress.report({ message: `${pct}% (${humanBytes(bytes ?? 0)} / ${humanBytes(totalBytes)})` });
+            } else if (message) {
+              progress.report({ message });
+            }
+          };
+          return this.desktopEnv!.installer.ensure({
+            extensionRoot: this.desktopEnv!.extensionRoot,
+            cacheRoot: this.desktopEnv!.cacheRoot,
+            rid: settings.desktopAppRid || undefined,
+            userPath: settings.desktopApp.origin === 'user-setting' ? settings.desktopApp.path : undefined,
+            progress: reporter,
+            cancel: token,
+            offline: true,
+          });
+        }
+      );
+      this.resolvedDesktopApp = resolved;
+      return resolved;
+    } catch (err) {
+      // Give the debug console the full diagnostic dump before we
+      // rethrow — the notification bubble the user sees is
+      // necessarily short, but the console can carry everything.
+      const message = err instanceof Error ? err.message : String(err);
+      const code = err instanceof InstallerError ? err.code : 'unknown';
+      this.emitLine(`[extension] desktop-app install failed (code=${code}): ${message}\n`, 'stderr');
+      this.emitLine(`[extension] ${formatDiagnosticsReport(settings.desktopApp)}\n`, 'stderr');
+      throw new Error(`Cannot launch streaming viewer: ${message}`);
+    }
+  }
+
+  /**
+   * Info-line every run so users can eyeball the bundle version; warn
+   * notification only when the binary is genuinely stale.
+   *
+   * With the download-on-first-run model, the realistic stale states
+   * are:
+   *   • dev mode: bootstrap.js built an outdated binary → Rebuild
+   *   • cached/downloaded: some corruption of BUILD_INFO.json in the
+   *     archive → advise a redownload via the doctor command
+   *
+   * The `resolved` argument tells us WHERE the binary came from so
+   * we can pick the right remediation.
+   */
+  private reportDesktopAppFreshness(info: import('./desktopAppFreshness').DesktopAppInfo, resolved: ResolvedSource): void {
+    const originLabel = resolved.kind === 'downloaded'
+      ? `downloaded (v${'version' in resolved ? resolved.version : '?'})`
+      : resolved.kind === 'cached'
+        ? `cached (v${'version' in resolved ? resolved.version : '?'})`
+        : resolved.kind;
+    this.emitLine(`[extension] desktop app: ${info.path} [${originLabel}]\n`, 'console');
+    this.emitLine(`[extension] desktop app info: ${formatBuildInfoLine(info)}\n`, 'console');
+    if (!isStale(info)) return;
+    const reason = stalenessReason(info);
+    this.emitLine(`[extension] ⚠ ${reason}\n`, 'stderr');
+    const actions = resolved.kind === 'bundled'
+      ? ['Rebuild Desktop App (dev mode)', 'Dismiss']
+      : ['Run Doctor', 'Dismiss'];
+    void vscode.window
+      .showWarningMessage(`Emulator Stream: ${reason}`, ...actions)
+      .then((choice) => {
+        if (choice === 'Rebuild Desktop App (dev mode)') {
+          void vscode.commands.executeCommand(REBUILD_COMMAND);
+        } else if (choice === 'Run Doctor') {
+          void vscode.commands.executeCommand('emulatorStreamRun.doctor');
+        }
+      });
   }
 
   private async discoverAndPickDevice(client: ServerClient, settings: ResolvedSettings): Promise<DeviceEntry | null> {
@@ -154,52 +302,129 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Resolve project + flavor from either the pinned launch.json entry
-   * or the interactive Quick Pick. Pinned values take precedence; if
-   * the pinned name doesn't match anything on the server, we surface a
-   * clear error before doing any expensive work.
+   * Decide what to run based on user configuration, in this order:
+   *
+   *   1. **Ad-hoc projectPath** — user supplied a filesystem path on
+   *      the remote host (either via `emulatorStreamRun.projectPath`
+   *      or `launch.json`'s `projectPath`). We ask the server to
+   *      discover flavors for that path (`list_flavors`) and prompt a
+   *      flavor Quick Pick — no project picker needed.
+   *   2. **Registered projectId** — user pinned an id from the
+   *      server's flutter-projects.json. We fetch the project list
+   *      and look it up.
+   *   3. **Fully interactive** — no pins. Fetch the project list and
+   *      prompt project + flavor Quick Picks.
+   *
+   * Returns null when the user cancelled a picker (the orchestrator
+   * has already emitted a cancelled message and shut down).
    */
-  private async resolveProject(
-    projects: ProjectEntry[],
+  private async resolveRemoteProject(
+    client: ServerClient,
     settings: ResolvedSettings
-  ): Promise<{ project: ProjectEntry | null; flavor: ProjectFlavor | null }> {
+  ): Promise<ResolvedRun | null> {
+    if (settings.projectId && settings.projectPath) {
+      this.emitLine(
+        '[extension] both projectId and projectPath were set — preferring projectPath\n',
+        'stderr'
+      );
+    }
+
+    // Branch a — ad-hoc projectPath (dynamic remote path).
+    if (settings.projectPath) {
+      this.emitStatus(`Discovering flavors for ${settings.projectPath}…`);
+      const info = await client.fetchFlavors(settings.projectPath, settings.flutterPath);
+      this.emitLine(
+        `[extension] ${info.flavors.length} flavor(s) discovered at ${info.projectPath}\n`,
+        'console'
+      );
+      try {
+        const flavor = await this.pickFlavor(info.flavors, info.name, settings);
+        return {
+          projectPath: info.projectPath,
+          flutterPath: settings.flutterPath,
+          displayName: info.name,
+          flavor,
+        };
+      } catch (err) {
+        return this.handlePickerCancel(err);
+      }
+    }
+
+    // Branch b — registered projectId (or fully interactive).
+    this.emitStatus('Fetching remote projects…');
+    const projects = await client.fetchProjects();
+
     if (settings.projectId) {
       const proj = projects.find((p) => p.id === settings.projectId);
       if (!proj) {
         throw new Error(
           `Project "${settings.projectId}" is not configured on the server. ` +
-          `Known: ${projects.map((p) => p.id).join(', ') || '(none)'}`
+          `Known: ${projects.map((p) => p.id).join(', ') || '(none)'}. ` +
+          `Alternatively set emulatorStreamRun.projectPath / launch.json "projectPath" ` +
+          `to point at a Flutter folder on the remote directly.`
         );
       }
-      const flavor = settings.flavor
-        ? proj.flavors.find((f) => f.name === settings.flavor) ?? null
-        : null;
-      if (settings.flavor && !flavor) {
-        throw new Error(
-          `Flavor "${settings.flavor}" is not defined for project "${proj.id}". ` +
-          `Known: ${proj.flavors.map((f) => f.name).join(', ') || '(none)'}`
-        );
+      try {
+        const flavor = await this.pickFlavor(proj.flavors, proj.name, settings);
+        return {
+          projectId: proj.id,
+          displayName: proj.name,
+          flavor,
+        };
+      } catch (err) {
+        return this.handlePickerCancel(err);
       }
-      return { project: proj, flavor };
     }
+
+    // Branch c — full interactive pick.
     try {
       const lastProject = this.lastChoiceStore?.get<string>(`lastProject:${this.workspaceKey}`);
       const lastFlavor  = this.lastChoiceStore?.get<string>(`lastFlavor:${this.workspaceKey}`);
       const picked = await pickProjectAndFlavor(projects, { lastProject, lastFlavor });
-      // Remember for next time.
       if (this.lastChoiceStore) {
         await this.lastChoiceStore.update(`lastProject:${this.workspaceKey}`, picked.project.id);
         await this.lastChoiceStore.update(`lastFlavor:${this.workspaceKey}`,  picked.flavor?.name ?? '');
       }
-      return picked;
+      return {
+        projectId: picked.project.id,
+        displayName: picked.project.name,
+        flavor: picked.flavor,
+      };
     } catch (err) {
-      if (err instanceof UserCancelled) {
-        this.emitLine('[extension] cancelled\n', 'console');
-        await this.stop('cancelled');
-        return { project: null, flavor: null };
-      }
-      throw err;
+      return this.handlePickerCancel(err);
     }
+  }
+
+  /**
+   * Common flavor selector: honours `settings.flavor` pin, otherwise
+   * falls back to the Quick Pick from projectPicker. Used by both the
+   * ad-hoc projectPath path and the registered projectId path.
+   */
+  private async pickFlavor(
+    flavors: ProjectFlavor[],
+    projectDisplayName: string,
+    settings: ResolvedSettings
+  ): Promise<ProjectFlavor | null> {
+    if (settings.flavor) {
+      const hit = flavors.find((f) => f.name === settings.flavor);
+      if (!hit) {
+        throw new Error(
+          `Flavor "${settings.flavor}" is not defined for ${projectDisplayName}. ` +
+          `Known: ${flavors.map((f) => f.name).join(', ') || '(none)'}`
+        );
+      }
+      return hit;
+    }
+    return pickFlavorFromList(flavors, projectDisplayName);
+  }
+
+  private handlePickerCancel(err: unknown): null {
+    if (err instanceof UserCancelled) {
+      this.emitLine('[extension] cancelled\n', 'console');
+      void this.stop('cancelled');
+      return null;
+    }
+    throw err;
   }
 
   private waitForAppReady(timeoutMs: number): Promise<void> {
@@ -255,9 +480,9 @@ export class Orchestrator extends EventEmitter {
 
   // ── Helpers ────────────────────────────────────────────────────────────
 
-  private spawnStream(settings: ResolvedSettings, sessionId: string): void {
+  private spawnStream(settings: ResolvedSettings, sessionId: string, desktopAppPath: string): void {
     if (!this.device) throw new Error('no device');
-    if (!settings.desktopAppPath) throw new Error('desktop app path unresolved');
+    if (!desktopAppPath) throw new Error('desktop app path unresolved');
     const stream = new StreamProcess();
     this.stream = stream;
     stream.on('output', (chunk: string, cat: 'stdout' | 'stderr') => this.emitLine(chunk, cat));
@@ -269,7 +494,7 @@ export class Orchestrator extends EventEmitter {
     });
     stream.on('error', (err: Error) => this.emit('error', err));
     stream.spawn({
-      desktopAppPath: settings.desktopAppPath,
+      desktopAppPath,
       server: settings.server,
       deviceId: this.device.device_id,
       sessionId,
@@ -302,4 +527,11 @@ function raceExit(proc: StreamProcess, timeoutMs: number): Promise<boolean> {
     const timer = setTimeout(() => resolve(false), timeoutMs);
     proc.once('exit', () => { clearTimeout(timer); resolve(true); });
   });
+}
+
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

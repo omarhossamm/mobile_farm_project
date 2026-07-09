@@ -29,12 +29,29 @@ export async function pickProjectAndFlavor(
   if (projects.length === 0) {
     throw new Error(
       'No Flutter projects are configured on the server. ' +
-      'Ask the operator to add one to flutter-projects.json.'
+      'Either add one to flutter-projects.json on the remote, or set ' +
+      'emulatorStreamRun.projectPath (or launch.json "projectPath") ' +
+      'to point at a Flutter folder on the remote directly.'
     );
   }
   const project = await pickProject(projects, opts.lastProject);
   const flavor  = await pickFlavor(project, opts.lastFlavor);
   return { project, flavor };
+}
+
+/**
+ * Public flavor-only picker used when the project is already known
+ * (either pinned by id or supplied as an ad-hoc projectPath — see
+ * orchestrator.resolveRemoteProject). Same UX as the flavor step of
+ * `pickProjectAndFlavor`: no prompt when the list has zero or one
+ * entries, otherwise a Quick Pick with a "Default" fall-through.
+ */
+export async function pickFlavorFromList(
+  flavors: ProjectFlavor[],
+  projectDisplayName: string,
+  lastFlavor?: string
+): Promise<ProjectFlavor | null> {
+  return pickFlavor({ id: projectDisplayName, name: projectDisplayName, flavors }, lastFlavor);
 }
 
 async function pickProject(projects: ProjectEntry[], lastId?: string): Promise<ProjectEntry> {

@@ -323,11 +323,10 @@ namespace EmulatorDesktopApp.Services
             }
         }
 
-        /// <summary>Load order for Gyan codexffmpeg 8.1 shared DLLs (dependencies first).</summary>
+        /// <summary>Decode-only FFmpeg DLLs (H.264 WebRTC via SIPSorcery). Load order: deps first.</summary>
         private static readonly string[] WindowsFfmpegLoadOrder =
         {
-            "avutil-60.dll", "swresample-6.dll", "swscale-9.dll",
-            "avcodec-62.dll", "avformat-62.dll", "avfilter-11.dll", "avdevice-62.dll"
+            "avutil-60.dll", "swresample-6.dll", "swscale-9.dll", "avcodec-62.dll",
         };
 
         private static readonly string[] WindowsRequiredFfmpegDlls = WindowsFfmpegLoadOrder;
@@ -514,6 +513,24 @@ namespace EmulatorDesktopApp.Services
                 FFmpegInit.Initialise(
                     logLevel: FfmpegLogLevelEnum.AV_LOG_WARNING,
                     appLogger: _diagLogger);
+
+            // Cap FFmpeg's native log verbosity to ERROR.
+            //
+            // AV_LOG_WARNING lets through one benign line per stream startup
+            // from libswscale:
+            //   "[swscaler @ 0x...] No accelerated colorspace conversion
+            //    found from yuv420p to rgb24"
+            // — SIPSorceryMedia.FFmpeg 10.0.7 hard-codes the decoder output
+            // as rgb24 and libswscale has no SIMD path for yuv420p→rgb24, so
+            // it falls back to a C loop. That is FINE for 720x1280@30fps
+            // (well within scalar CPU throughput) but the message keeps
+            // scaring operators. Real problems (concealment frames, missing
+            // PPS, decoder errors) come through at ERROR level and are still
+            // captured by AbDiagnosticsLogger above.
+            //
+            // If you ever need the warnings back for diagnosing corruption,
+            // change the level here to AV_LOG_WARNING.
+            ffmpeg.av_log_set_level(ffmpeg.AV_LOG_ERROR);
 
             _ffmpegInitialized = true;
         }

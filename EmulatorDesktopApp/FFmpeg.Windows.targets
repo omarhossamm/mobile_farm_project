@@ -3,10 +3,12 @@
   <!-- FFmpeg.AutoGen 8.1.0 requires GyanD/codexffmpeg 8.1 full_build-shared DLLs. -->
 
   <PropertyGroup>
-    <FFmpegDestDir>$(MSBuildProjectDirectory)\ffmpeg\win-x64\</FFmpegDestDir>
-    <FFmpegOutDir>$(OutDir)ffmpeg\win-x64\</FFmpegOutDir>
+    <FFmpegDestDir>$(MSBuildProjectDirectory)/ffmpeg/win-x64/</FFmpegDestDir>
+    <FFmpegOutDir>$(OutDir)ffmpeg/win-x64/</FFmpegOutDir>
     <FFmpegZipUrl Condition="'$(FFmpegZipUrl)' == ''">https://github.com/GyanD/codexffmpeg/releases/download/8.1/ffmpeg-8.1-full_build-shared.zip</FFmpegZipUrl>
-    <FFmpegCacheDir>$(LocalAppData)\EmulatorDesktopApp\ffmpeg-cache</FFmpegCacheDir>
+    <FFmpegCacheDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(LocalAppData)\EmulatorDesktopApp\ffmpeg-cache</FFmpegCacheDir>
+    <FFmpegCacheDir Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(HOME)/Library/Caches/EmulatorDesktopApp/ffmpeg-cache</FFmpegCacheDir>
+    <FFmpegCacheDir Condition="'$(FFmpegCacheDir)' == ''">$(MSBuildProjectDirectory)/.ffmpeg-cache</FFmpegCacheDir>
     <FFmpegZipFileName>ffmpeg-8.1-full_build-shared.zip</FFmpegZipFileName>
     <FFmpegBundleStampFile>$(FFmpegDestDir).bundle-source</FFmpegBundleStampFile>
     <FFmpegBundleStamp>gyan-codexffmpeg-8.1-full-shared</FFmpegBundleStamp>
@@ -97,10 +99,25 @@
           AfterTargets="EnsureNativeFFmpeg"
           BeforeTargets="ComputeFilesToPublish"
           Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
-    <PropertyGroup>
-      <FFmpegOutDir>$(PublishDir)ffmpeg\win-x64\</FFmpegOutDir>
-    </PropertyGroup>
     <CallTarget Targets="_CopyFfmpegNativeToOutputImpl" />
+  </Target>
+
+  <!-- Ensure publish picks up ffmpeg/win-x64 even when cross-compiling on macOS/Linux. -->
+  <Target Name="IncludeFfmpegInPublish"
+          AfterTargets="CopyFfmpegNativeBeforePublish"
+          BeforeTargets="ComputeFilesToPublish"
+          Condition="Exists('$(FFmpegDestDir)avutil-60.dll')">
+    <ItemGroup>
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)avutil-60.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)swresample-6.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)swscale-9.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <ResolvedFileToPublish Include="@(_FfmpegPublishDll)">
+        <RelativePath>ffmpeg/win-x64/%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+    <Message Importance="high" Text="[FFmpeg] Added 4 DLL(s) to publish manifest under ffmpeg/win-x64/" />
   </Target>
 
   <Target Name="_CopyFfmpegNativeToOutputImpl">
@@ -109,9 +126,6 @@
       <_FfmpegNativeDll Include="$(FFmpegDestDir)swresample-6.dll" />
       <_FfmpegNativeDll Include="$(FFmpegDestDir)swscale-9.dll" />
       <_FfmpegNativeDll Include="$(FFmpegDestDir)avcodec-62.dll" />
-      <_FfmpegNativeDll Include="$(FFmpegDestDir)avformat-62.dll" />
-      <_FfmpegNativeDll Include="$(FFmpegDestDir)avfilter-11.dll" />
-      <_FfmpegNativeDll Include="$(FFmpegDestDir)avdevice-62.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avutil-*.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avcodec-*.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avformat-*.dll" />
@@ -127,6 +141,6 @@
           DestinationFolder="$(FFmpegOutDir)"
           SkipUnchangedFiles="false"
           OverwriteReadOnlyFiles="true" />
-    <Message Importance="high" Text="[FFmpeg] Copied 7 DLL(s) to $(FFmpegOutDir)" />
+    <Message Importance="high" Text="[FFmpeg] Copied 4 DLL(s) to $(FFmpegOutDir)" />
   </Target>
 </Project>

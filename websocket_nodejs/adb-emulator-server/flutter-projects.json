@@ -1,5 +1,11 @@
 {
-  "$schema-hint": "One entry per Flutter project on THIS server host. Clients (VS Code extension) will see them in a Quick Pick. If `flavors` is omitted, the server auto-derives them from the project's .vscode/launch.json and lib/main_*.dart files.",
+  "$schema-hint": "One entry per Flutter project on THIS server host. Clients (VS Code extension) will see them in a Quick Pick. If `flavors` is omitted, the server auto-derives them from the project's .vscode/launch.json and lib/main_*.dart files. The optional top-level `workspace` block configures per-session isolation (see README): default { root: './.session-workspaces', mode: 'copy' }. Each project may override with its own `workspace: { mode: 'shared' | 'copy', excludeDirs: [...], excludeFiles: [...] }`.",
+  "workspace": {
+    "$hint": "OPTIONAL. Remove this block to accept defaults (mode='copy', root='./.session-workspaces').",
+    "root": "./.session-workspaces",
+    "mode": "copy",
+    "snapshotTimeoutMs": 120000
+  },
   "projects": [
     {
       "id": "elm-employee-hub",

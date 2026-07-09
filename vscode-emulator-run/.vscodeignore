@@ -1,7 +1,49 @@
+# What ends up inside the .vsix.
+#
+# Guiding rule: ship the compiled extension (out/), everything under
+# vendor/desktop-app/ (that's the whole point of self-containment),
+# and the metadata the marketplace wants (package.json, README, LICENSE).
+# Everything else — source, tests, dev deps, .NET project — must NOT
+# be in the .vsix so we don't bloat installs or ship half-built code.
+
+# Source & build artefacts we don't need at runtime.
+src/**
+scripts/**
+tsconfig.json
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+*.map
+*.log
+
+# Editor / VCS scaffolding.
 .vscode/**
 .vscode-test/**
-src/**
-node_modules/.cache/**
-*.map
-tsconfig.json
+.git/**
 .gitignore
+.gitattributes
+.eslintrc*
+.editorconfig
+.prettierrc*
+
+# node_modules should NEVER be inside the .vsix — vsce will only pull
+# in *runtime* deps by default anyway; caches definitely stay out.
+node_modules/.cache/**
+node_modules/**/*.md
+node_modules/**/*.map
+node_modules/**/*.ts
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/example/**
+node_modules/**/docs/**
+
+# Sibling .NET project source must never be bundled — the compiled
+# publish output already lives under vendor/desktop-app/. If someone
+# runs `vsce package` from a checkout where the parent folder is
+# accessible, defensively exclude the entire source tree.
+../EmulatorDesktopApp/**
+
+# Explicit whitelist of debug-only artefacts inside the desktop-app
+# publish output. `dotnet publish -c Release` shouldn't produce them
+# but excluding is cheaper than the alternative.
+vendor/desktop-app/**/*.pdb
+vendor/desktop-app/**/*.xml

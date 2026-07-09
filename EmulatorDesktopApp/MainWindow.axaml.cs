@@ -94,14 +94,17 @@ public partial class MainWindow : Window
         if (_viewModel != null)
             _viewModel.PropertyChanged += OnViewModelPropertyChanged;
 
-        // Extension-driven launch: run the whole connect/pick/stream
-        // chain automatically. Falls back to the classic manual UI when
-        // no --auto-start flag was passed.
-        var opts = LaunchOptions.Current;
-        if (_viewModel != null && opts.AutoStart && !string.IsNullOrWhiteSpace(opts.Server) && !string.IsNullOrWhiteSpace(opts.DeviceId))
-        {
-            _ = _viewModel.AutoStartAsync(opts.Server!, opts.DeviceId!);
-        }
+        // Note: the extension-driven --auto-start flow is handled by
+        // App.OnFrameworkInitializationCompleted in a truly headless
+        // path — MainWindow is never constructed in that mode. This
+        // OnWindowLoaded therefore only runs when the user launched
+        // the app interactively (no CLI args), so there is nothing to
+        // auto-start here.
+        StartupLog.Info(
+            $"MainWindow.OnWindowLoaded — interactive mode. " +
+            $"LaunchOptions.AutoStart={LaunchOptions.Current.AutoStart} " +
+            $"(if this is true, the extension launched us but the " +
+            $"headless branch was NOT taken — see App.axaml.cs log lines)");
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)

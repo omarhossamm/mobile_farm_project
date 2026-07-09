@@ -38,7 +38,17 @@ public partial class App : Application
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             var opts = LaunchOptions.Current;
-            if (opts.AutoStart && !string.IsNullOrWhiteSpace(opts.Server) && !string.IsNullOrWhiteSpace(opts.DeviceId))
+            var shouldHeadless =
+                opts.AutoStart &&
+                !string.IsNullOrWhiteSpace(opts.Server) &&
+                !string.IsNullOrWhiteSpace(opts.DeviceId);
+
+            StartupLog.Info(
+                $"OnFrameworkInitializationCompleted: shouldHeadless={shouldHeadless} " +
+                $"AutoStart={opts.AutoStart} Server?={!string.IsNullOrWhiteSpace(opts.Server)} " +
+                $"DeviceId?={!string.IsNullOrWhiteSpace(opts.DeviceId)}");
+
+            if (shouldHeadless)
             {
                 // Explicit shutdown: no MainWindow, no auto-quit when
                 // there are momentarily zero windows during the async
@@ -50,8 +60,13 @@ public partial class App : Application
             }
             else
             {
+                StartupLog.Info("Interactive mode: creating MainWindow");
                 desktop.MainWindow = new MainWindow();
             }
+        }
+        else
+        {
+            StartupLog.Info($"ApplicationLifetime is NOT IClassicDesktopStyleApplicationLifetime — was {ApplicationLifetime?.GetType().FullName ?? "<null>"}");
         }
 
         base.OnFrameworkInitializationCompleted();
@@ -59,7 +74,7 @@ public partial class App : Application
 
     private void StartHeadless(IClassicDesktopStyleApplicationLifetime desktop, LaunchOptions opts)
     {
-        System.Console.WriteLine("[app] headless mode: main window suppressed; will show StreamWindow only.");
+        StartupLog.Info("Headless mode: MainWindow suppressed; will show StreamWindow only");
         var vm = new MainWindowViewModel(OpenStreamWindow, CloseStreamWindow);
         _headlessViewModel = vm;
 
@@ -71,23 +86,28 @@ public partial class App : Application
             {
                 await vm.AutoStartAsync(opts.Server!, opts.DeviceId!, opts.SessionId);
             }
-            catch
+            catch (System.Exception ex)
             {
                 // Errors are already appended to the ViewModel log; we
                 // just make sure the process doesn't hang if the auto-
                 // start pipeline throws before OpenStreamWindow runs.
+                StartupLog.Info($"AutoStartAsync threw: {ex.Message}");
             }
 
             // If auto-start finished (with or without success) and no
             // stream window ever opened, there's nothing to display —
             // exit cleanly instead of leaving a zombie process.
-            if (_streamWindow == null) desktop.Shutdown(0);
+            if (_streamWindow == null)
+            {
+                StartupLog.Info("AutoStart finished with no StreamWindow → shutdown");
+                desktop.Shutdown(0);
+            }
         });
     }
 
     private void OpenStreamWindow(StreamWindowViewModel svm)
     {
-        System.Console.WriteLine("[app] opening StreamWindow (headless mode, main window never shown)");
+        StartupLog.Info("OpenStreamWindow (headless mode, main window never shown)");
         CloseStreamWindow();
         _streamWindow = new StreamWindow { DataContext = svm };
         svm.OnFrameUpdated = () => _streamWindow?.InvalidateVideoFrame();

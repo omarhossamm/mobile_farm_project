@@ -8,6 +8,19 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <!-- Smallest safe Release publish: no symbols, no satellite languages, no R2R bloat. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <CopyDebugSymbolFilesFromPackages>false</CopyDebugSymbolFilesFromPackages>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebuggerSupport>false</DebuggerSupport>
+    <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
+    <EnableUnsafeUTF7Encoding>false</EnableUnsafeUTF7Encoding>
+  </PropertyGroup>
+
   <!-- FFmpeg native DLLs are win-x64; force 64-bit on Windows (32-bit cannot load them). -->
   <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <PlatformTarget>x64</PlatformTarget>
@@ -36,5 +49,11 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
   </ItemGroup>
 
-  <Import Project="FFmpeg.Windows.targets" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+  <!-- Bundle Gyan FFmpeg DLLs when building ON Windows OR when cross-publishing FOR a win-* RID (e.g. macOS → win-x64). -->
+  <PropertyGroup>
+    <_BundleWindowsFfmpeg>false</_BundleWindowsFfmpeg>
+    <_BundleWindowsFfmpeg Condition="$([MSBuild]::IsOSPlatform('Windows'))">true</_BundleWindowsFfmpeg>
+    <_BundleWindowsFfmpeg Condition="'$(RuntimeIdentifier)' != '' and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))">true</_BundleWindowsFfmpeg>
+  </PropertyGroup>
+  <Import Project="FFmpeg.Windows.targets" Condition="'$(_BundleWindowsFfmpeg)' == 'true'" />
 </Project>

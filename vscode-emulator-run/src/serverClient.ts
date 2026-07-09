@@ -44,7 +44,16 @@ export interface ProjectEntry {
 }
 
 export interface RunFlutterOptions {
-  projectId: string;
+  /** Registered project id (from server's flutter-projects.json). Exclusive with `projectPath`. */
+  projectId?: string;
+  /**
+   * Ad-hoc filesystem path on the REMOTE machine. When set, the
+   * server treats it like a project without needing it in
+   * flutter-projects.json. Exclusive with `projectId`.
+   */
+  projectPath?: string;
+  /** Override the `flutter` binary for ad-hoc projectPath runs. Falls back to `flutter` on PATH. */
+  flutterPath?: string;
   flavorName?: string;
   deviceId: string;
   extraArgs?: string[];
@@ -53,8 +62,20 @@ export interface RunFlutterOptions {
 export interface RunHandle {
   runId: string;
   projectId: string;
+  projectPath: string;
   deviceId: string;
   flavor: string | null;
+}
+
+/**
+ * Result of `list_flavors` for an ad-hoc `projectPath`. Mirrors the
+ * flavor entries embedded in `list_projects` — the server does the
+ * same auto-discovery either way (launch.json + `lib/main_*.dart`).
+ */
+export interface AdHocProjectInfo {
+  projectPath: string;
+  name: string;
+  flavors: ProjectFlavor[];
 }
 
 /**
@@ -135,6 +156,26 @@ export class ServerClient extends EventEmitter {
     return Array.isArray(list) ? list : [];
   }
 
+  /**
+   * Ask the server "given this raw path on your filesystem, what
+   * flavors would you discover for it?" Used by the extension when
+   * the user pins `emulatorStreamRun.projectPath` — we skip the
+   * registered-project picker and drive the flavor Quick Pick from
+   * the response instead.
+   */
+  async fetchFlavors(projectPath: string, flutterPath?: string): Promise<AdHocProjectInfo> {
+    const res = await this.request('list_flavors', {
+      projectPath,
+      flutterPath: flutterPath ?? null,
+    });
+    const data = res?.data ?? {};
+    return {
+      projectPath: String(data.projectPath ?? projectPath),
+      name: String(data.name ?? projectPath),
+      flavors: Array.isArray(data.flavors) ? data.flavors : [],
+    };
+  }
+
   async createSession(deviceId: string): Promise<string> {
     const res = await this.request('create_session', { device: deviceId }, 60_000);
     const sid = res?.data?.session_id ?? this.sessionId;
@@ -150,15 +191,24 @@ export class ServerClient extends EventEmitter {
   }
 
   async runFlutter(opts: RunFlutterOptions): Promise<RunHandle> {
+    if (!opts.projectId && !opts.projectPath) {
+      throw new Error('runFlutter needs one of projectId or projectPath');
+    }
+    if (opts.projectId && opts.projectPath) {
+      throw new Error('runFlutter accepts projectId OR projectPath, not both');
+    }
     const res = await this.request('run_flutter', {
-      projectId: opts.projectId,
+      projectId: opts.projectId ?? null,
+      projectPath: opts.projectPath ?? null,
+      flutterPath: opts.flutterPath ?? null,
       flavorName: opts.flavorName ?? null,
       deviceId: opts.deviceId,
       extraArgs: opts.extraArgs ?? [],
     });
     return {
       runId: String(res?.data?.runId ?? ''),
-      projectId: String(res?.data?.projectId ?? opts.projectId),
+      projectId: String(res?.data?.projectId ?? opts.projectId ?? ''),
+      projectPath: String(res?.data?.projectPath ?? opts.projectPath ?? ''),
       deviceId: String(res?.data?.deviceId ?? opts.deviceId),
       flavor: res?.data?.flavor ?? null,
     };

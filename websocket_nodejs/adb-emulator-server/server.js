@@ -20,6 +20,15 @@ const { killOrphanedScrcpyOnDevice } = require('./stream/capture/android/ScrcpyC
 const { buildDeviceCatalog, resolveAvdNameForDevice } = require('./devicesCatalog');
 const { platformHost } = require('./platform');
 const flutterRunner = require('./flutter/FlutterRunner');
+const flutterProjectRegistry = require('./flutter/projectRegistry');
+const sessionWorkspace = require('./flutter/sessionWorkspace');
+
+// Initialise the session-scoped Flutter workspace manager as early
+// as possible: it reads its config from the same flutter-projects.json
+// projectRegistry already parsed, then reaps orphan snapshots left
+// on disk by a previous (crashed) server process. Any second-call is
+// a no-op — see sessionWorkspace.initFromConfig.
+sessionWorkspace.initFromConfig({ workspace: flutterProjectRegistry.getWorkspaceConfig() });
 const simctl = require('./lib/simctl');
 const { resolveDeviceGeometry } = require('./config/iosDeviceSizes');
 
@@ -1284,6 +1293,7 @@ const messageHandlers = {
   // `flutter run` entirely on the server host. The developer never
   // needs Flutter SDK, ADB, or Xcode locally.  See flutter/FlutterRunner.js.
   list_projects:   (session, payload) => flutterRunner.list_projects(session, payload),
+  list_flavors:    (session, payload) => flutterRunner.list_flavors(session, payload),
   run_flutter:     (session, payload) => flutterRunner.run_flutter(session, payload),
   stop_flutter:    (session, payload) => flutterRunner.stop_flutter(session, payload),
   flutter_hotkey:  (session, payload) => flutterRunner.flutter_hotkey(session, payload),

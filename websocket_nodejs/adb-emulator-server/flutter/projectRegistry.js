@@ -55,8 +55,16 @@ const logger = {
  * with fully-resolved flavors. Returns [] if the config is missing or
  * unreadable (with a warn log — this is a legitimate operator state,
  * not a crash condition).
+ *
+ * We also parse — and cache — the top-level `workspace` block for
+ * `sessionWorkspace.initFromConfig` to consume. Per-project
+ * overrides are attached to each returned project entry under
+ * `.workspace` so FlutterRunner can pick the right isolation mode.
  */
+let _workspaceConfig = {};
+
 function loadProjects() {
+  _workspaceConfig = {};
   if (!fs.existsSync(CONFIG_FILE)) {
     logger.warn(`No flutter-projects.json at ${CONFIG_FILE} — extension will see an empty project list`);
     return [];
@@ -68,6 +76,10 @@ function loadProjects() {
   } catch (err) {
     logger.error(`flutter-projects.json is not valid JSON: ${err.message}`);
     return [];
+  }
+
+  if (raw?.workspace && typeof raw.workspace === 'object') {
+    _workspaceConfig = raw.workspace;
   }
 
   const projects = Array.isArray(raw?.projects) ? raw.projects : [];
@@ -99,6 +111,9 @@ function normalizeProject(raw) {
     path: abs,
     flutterPath: String(raw.flutterPath || 'flutter'),
     flavors,
+    // Per-project workspace overrides. FlutterRunner resolves these
+    // against the global workspace config at run time.
+    workspace: raw.workspace && typeof raw.workspace === 'object' ? raw.workspace : null,
   };
 }
 
@@ -190,21 +205,81 @@ function parseJsonWithComments(text) {
 let cache = loadProjects();
 logger.info(`Loaded ${cache.length} Flutter project(s) from ${CONFIG_FILE}`);
 
+/**
+ * Build an "ad-hoc" project entry from a raw filesystem path the
+ * client supplies at runtime (see the `projectPath` launch config on
+ * the extension side). This is how we let a VS Code user point at any
+ * Flutter checkout on the remote host WITHOUT having to edit
+ * flutter-projects.json first — the config file becomes optional.
+ *
+ * Returns `{ ok: true, project }` when the path is valid, or
+ * `{ ok: false, error }` with a human-readable reason.
+ *
+ * `flutterPath` may be null → falls back to `flutter` on PATH.
+ */
+function buildAdHocProject(projectPath, flutterPath = null) {
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return { ok: false, error: 'projectPath must be a non-empty string' };
+  }
+  const abs = path.resolve(projectPath);
+  if (!fs.existsSync(abs)) {
+    return { ok: false, error: `projectPath does not exist on the server: ${abs}` };
+  }
+  const stat = fs.statSync(abs);
+  if (!stat.isDirectory()) {
+    return { ok: false, error: `projectPath is not a directory: ${abs}` };
+  }
+  if (!fs.existsSync(path.join(abs, 'pubspec.yaml'))) {
+    return { ok: false, error: `Not a Flutter project — no pubspec.yaml at ${abs}` };
+  }
+  return {
+    ok: true,
+    project: {
+      // `path` doubles as the id for ad-hoc projects; the extension
+      // never treats these ids as opaque anyway (the client supplies
+      // the path directly on every subsequent call).
+      id: abs,
+      name: path.basename(abs),
+      path: abs,
+      flutterPath: typeof flutterPath === 'string' && flutterPath.length > 0 ? flutterPath : 'flutter',
+      flavors: discoverFlavors(abs),
+      // Ad-hoc projects have no explicit per-project workspace
+      // config — they inherit the global default.
+      workspace: null,
+    },
+  };
+}
+
+/**
+ * Public flavor-only shape returned by `list_flavors` — mirrors the
+ * one embedded in `list_projects` responses.
+ */
+function publicFlavor(f) {
+  return {
+    name: f.name,
+    target: f.target,
+    flavor: f.flavor,
+    args: f.args,
+  };
+}
+
 module.exports = {
   /** Reload from disk (useful for hot-editing the config file). */
   reload() { cache = loadProjects(); return cache; },
+
+  /**
+   * Return the top-level `workspace` block from flutter-projects.json.
+   * Used by sessionWorkspace to configure isolation defaults.
+   * Guaranteed to be a (possibly empty) plain object — never null.
+   */
+  getWorkspaceConfig() { return { ..._workspaceConfig }; },
 
   /** All projects (safe view; excludes filesystem path from the wire shape). */
   listProjects() {
     return cache.map((p) => ({
       id: p.id,
       name: p.name,
-      flavors: p.flavors.map((f) => ({
-        name: f.name,
-        target: f.target,
-        flavor: f.flavor,
-        args: f.args,
-      })),
+      flavors: p.flavors.map(publicFlavor),
     }));
   },
 
@@ -219,4 +294,8 @@ module.exports = {
     if (!p) return null;
     return p.flavors.find((f) => f.name === flavorName) || null;
   },
+
+  buildAdHocProject,
+  publicFlavor,
+  discoverFlavors,
 };

@@ -53,6 +53,84 @@ npm run dev
 | `SESSION_CLEANUP_INTERVAL` | `300000` | Stale session cleanup interval (ms) |
 | `KILL_EMULATOR_ON_DISCONNECT` | `true` | Kill emulators when session disconnects |
 
+## Isolated Session Workspaces
+
+The server supports multiple developers running `flutter run` against
+the **same** origin project at the **same time**, without their build
+outputs colliding. Each WebSocket session that calls `run_flutter`
+gets its own snapshot of the origin on disk; Flutter's cwd points at
+the snapshot, and every write it does (`.dart_tool/`, `build/`,
+`ios/Pods/`, `android/.gradle/`, `pubspec.lock`, …) lands inside that
+snapshot. When the session ends (WS close, `destroy_session`, or the
+server restarts) the snapshot is removed.
+
+The client protocol is unchanged. `run_flutter` still accepts
+`projectId` **or** `projectPath` exactly as before, and the response
+still returns the original `projectPath`. Two new additive fields —
+`workspacePath` and `workspaceIsolated` — are appended for
+observability; older clients ignore them.
+
+### Configuration
+
+Add an optional top-level `workspace` block to `flutter-projects.json`:
+
+```jsonc
+{
+  "workspace": {
+    "root": "./.session-workspaces",  // absolute or relative to server dir
+    "mode": "copy",                    // "copy" (default) | "shared"
+    "snapshotTimeoutMs": 120000,       // abort a snapshot that exceeds this
+    "excludeDirs":  [ "custom/heavy/dir" ],
+    "excludeFiles": [ "custom/generated.txt" ]
+  },
+  "projects": [
+    { "id": "small-app", "path": "/srv/small-app" },
+    { "id": "shared-mode", "path": "/srv/legacy", "workspace": { "mode": "shared" } }
+  ]
+}
+```
+
+Modes:
+
+- **`copy`** *(default)* — full snapshot per session. Source files
+  (`lib/`, `test/`, `assets/`, platform folders minus their build
+  caches, `pubspec.yaml`, `pubspec.lock`) are copied; the mutable
+  build directories start empty so `flutter run` / `pub get` /
+  CocoaPods / Gradle regenerate them cleanly inside the snapshot.
+  Under the hood the server calls `fs.cpSync`, which forwards to
+  `copy_file_range` on Linux, `clonefile` on macOS APFS, and
+  `CopyFileEx` on Windows — very fast in practice.
+- **`shared`** — no isolation. The session uses the origin path as
+  its cwd (legacy behaviour). Provide this per-project when you want
+  a specific checkout treated as a single-tenant scratch space.
+
+The default exclude list already covers the mutable state produced by
+Flutter, Dart, pub, CocoaPods, Gradle, and Xcode. Extend it with
+`excludeDirs` / `excludeFiles` only when your project has extra heavy
+generated artefacts on the source side.
+
+### Lifecycle
+
+1. First `run_flutter` on a session **prepares** a snapshot under
+   `<root>/<sessionId>/`.
+2. Subsequent `run_flutter` calls on the same session **reuse** that
+   snapshot, so hot-restart / re-run keep their pub cache warm.
+3. Session close (WS close, `destroy_session`, network drop, server
+   killing an inactive session) **releases** the snapshot.
+4. On server startup, `reapOrphans()` deletes any snapshot dir left
+   over from a crashed prior process — no leftovers ever survive a
+   restart.
+
+### Operational notes
+
+- Snapshot root should live on the **same filesystem** as the origin
+  projects for the fastest copy path (APFS/reflink and
+  `copy_file_range` only work within one volume).
+- The runner announces the isolation state via a `flutter_output`
+  message right after `flutter_run_started`, so the extension console
+  shows both the origin and the snapshot path — makes debugging
+  "which cwd is flutter actually in?" trivial.
+
 ## WebSocket API
 
 ### Connection
