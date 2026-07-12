@@ -4,10 +4,9 @@ import { ServerClient, type DeviceEntry, type ProjectFlavor, type RunHandle } fr
 import { pickDevice, UserCancelled, DeviceInUseError } from './devicePicker';
 import { pickProjectAndFlavor, pickFlavorFromList } from './projectPicker';
 import { StreamProcess } from './streamProcess';
-import { buildInfoForResolvedSource, type ResolvedSettings } from './settings';
+import { type ResolvedSettings } from './settings';
 import { formatBuildInfoLine, formatDiagnosticsReport, isStale, stalenessReason } from './desktopAppFreshness';
 import { REBUILD_COMMAND } from './rebuildCommand';
-import { DesktopAppInstaller, InstallerError, type ProgressReporter, type ResolvedSource } from './desktopAppInstaller';
 
 /**
  * Concrete "what to run" record produced by {@link Orchestrator.resolveRemoteProject}.
@@ -54,18 +53,6 @@ export interface OrchestratorEvents {
 
 type LastChoiceStore = vscode.Memento | undefined;
 
-/**
- * Everything the orchestrator needs to resolve the desktop app binary
- * (either from the shipped bundle, the on-disk cache, or by
- * downloading). Kept as its own type so callers can pass it in without
- * needing the full `vscode.ExtensionContext`.
- */
-export interface DesktopAppEnvironment {
-  extensionRoot: string;
-  cacheRoot: string;
-  installer: DesktopAppInstaller;
-}
-
 export class Orchestrator extends EventEmitter {
   private client: ServerClient | null = null;
   private stream: StreamProcess | null = null;
@@ -76,14 +63,11 @@ export class Orchestrator extends EventEmitter {
   private appReady = false;
   private workspaceKey: string;
   private lastChoiceStore: LastChoiceStore;
-  private desktopEnv: DesktopAppEnvironment | undefined;
-  private resolvedDesktopApp: ResolvedSource | null = null;
 
-  constructor(workspaceKey: string, lastChoiceStore: LastChoiceStore, desktopEnv?: DesktopAppEnvironment) {
+  constructor(workspaceKey: string, lastChoiceStore: LastChoiceStore) {
     super();
     this.workspaceKey = workspaceKey;
     this.lastChoiceStore = lastChoiceStore;
-    this.desktopEnv = desktopEnv;
   }
 
   async start(settings: ResolvedSettings): Promise<void> {
@@ -159,113 +143,37 @@ export class Orchestrator extends EventEmitter {
       this.emitStatus('Waiting for Flutter to start on device…');
       await this.waitForAppReady(180_000);
 
-      // Ensure a runnable desktop-app binary exists on this machine.
-      // This is the first (and only) time we ever touch the network
-      // in the F5 path: on a fresh install we'll download+extract
-      // the pinned archive; on subsequent runs we hit the local cache
-      // in a few milliseconds.
-      const resolvedApp = await this.ensureDesktopApp(settings);
-      const info = buildInfoForResolvedSource(resolvedApp.path, resolvedApp.kind, settings.desktopApp);
-      this.reportDesktopAppFreshness(info, resolvedApp);
+      // Everything the stream window needs lives inside this .vsix — no
+      // download, no cache lookup, no network. Fail early with a
+      // diagnostics dump if the bundled binary for this platform is
+      // missing (user installed the wrong .vsix).
+      if (!settings.desktopApp.path) {
+        this.emitLine(`[extension] ${formatDiagnosticsReport(settings.desktopApp)}\n`, 'stderr');
+        throw new Error(stalenessReason(settings.desktopApp) ||
+          'The bundled EmulatorDesktopApp binary is missing from this .vsix.');
+      }
+
+      this.reportDesktopAppFreshness(settings.desktopApp);
 
       this.emitStatus('Opening stream window…');
-      this.spawnStream(settings, sessionId, resolvedApp.path);
+      this.spawnStream(settings, sessionId, settings.desktopApp.path);
     }
 
     this.emitStatus('Running');
   }
 
   /**
-   * Make a runnable EmulatorDesktopApp available on this host — from
-   * user override, shipped bundle, cache, or by downloading. Wraps the
-   * download in `vscode.window.withProgress` so the user sees a
-   * cancellable spinner during first-run installs (usually seconds on
-   * broadband; the progress bar keeps them from thinking the extension
-   * hung).
-   */
-  private async ensureDesktopApp(settings: ResolvedSettings): Promise<ResolvedSource> {
-    if (this.resolvedDesktopApp) return this.resolvedDesktopApp;
-
-    if (!this.desktopEnv) {
-      // Old callers (e.g. tests) that constructed Orchestrator without
-      // an installer environment fall back to the sync path: any
-      // resolution the preliminary settings already made is used
-      // as-is; nothing downloads.
-      if (!settings.desktopApp.path) {
-        this.emitLine(`[extension] ${formatDiagnosticsReport(settings.desktopApp)}\n`, 'stderr');
-        throw new Error(stalenessReason(settings.desktopApp) ||
-          'Desktop app is missing and no installer was configured for this Orchestrator instance.');
-      }
-      this.resolvedDesktopApp = { kind: settings.desktopApp.origin === 'user-setting' ? 'user-setting' : 'bundled', path: settings.desktopApp.path } as ResolvedSource;
-      return this.resolvedDesktopApp;
-    }
-
-    try {
-      const resolved = await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: 'Emulator Stream: preparing streaming viewer',
-          cancellable: true,
-        },
-        async (progress, token) => {
-          const reporter: ProgressReporter = ({ phase, bytes, totalBytes, message }) => {
-            if (phase === 'downloading' && totalBytes) {
-              const pct = totalBytes > 0 ? Math.round(((bytes ?? 0) / totalBytes) * 100) : 0;
-              progress.report({ message: `${pct}% (${humanBytes(bytes ?? 0)} / ${humanBytes(totalBytes)})` });
-            } else if (message) {
-              progress.report({ message });
-            }
-          };
-          return this.desktopEnv!.installer.ensure({
-            extensionRoot: this.desktopEnv!.extensionRoot,
-            cacheRoot: this.desktopEnv!.cacheRoot,
-            rid: settings.desktopAppRid || undefined,
-            userPath: settings.desktopApp.origin === 'user-setting' ? settings.desktopApp.path : undefined,
-            progress: reporter,
-            cancel: token,
-            offline: true,
-          });
-        }
-      );
-      this.resolvedDesktopApp = resolved;
-      return resolved;
-    } catch (err) {
-      // Give the debug console the full diagnostic dump before we
-      // rethrow — the notification bubble the user sees is
-      // necessarily short, but the console can carry everything.
-      const message = err instanceof Error ? err.message : String(err);
-      const code = err instanceof InstallerError ? err.code : 'unknown';
-      this.emitLine(`[extension] desktop-app install failed (code=${code}): ${message}\n`, 'stderr');
-      this.emitLine(`[extension] ${formatDiagnosticsReport(settings.desktopApp)}\n`, 'stderr');
-      throw new Error(`Cannot launch streaming viewer: ${message}`);
-    }
-  }
-
-  /**
    * Info-line every run so users can eyeball the bundle version; warn
-   * notification only when the binary is genuinely stale.
-   *
-   * With the download-on-first-run model, the realistic stale states
-   * are:
-   *   • dev mode: bootstrap.js built an outdated binary → Rebuild
-   *   • cached/downloaded: some corruption of BUILD_INFO.json in the
-   *     archive → advise a redownload via the doctor command
-   *
-   * The `resolved` argument tells us WHERE the binary came from so
-   * we can pick the right remediation.
+   * notification only when the binary is genuinely stale (dev-mode
+   * BUILD_INFO features drifted from what the extension needs).
    */
-  private reportDesktopAppFreshness(info: import('./desktopAppFreshness').DesktopAppInfo, resolved: ResolvedSource): void {
-    const originLabel = resolved.kind === 'downloaded'
-      ? `downloaded (v${'version' in resolved ? resolved.version : '?'})`
-      : resolved.kind === 'cached'
-        ? `cached (v${'version' in resolved ? resolved.version : '?'})`
-        : resolved.kind;
-    this.emitLine(`[extension] desktop app: ${info.path} [${originLabel}]\n`, 'console');
+  private reportDesktopAppFreshness(info: import('./desktopAppFreshness').DesktopAppInfo): void {
+    this.emitLine(`[extension] desktop app: ${info.path} [${info.origin}]\n`, 'console');
     this.emitLine(`[extension] desktop app info: ${formatBuildInfoLine(info)}\n`, 'console');
     if (!isStale(info)) return;
     const reason = stalenessReason(info);
     this.emitLine(`[extension] ⚠ ${reason}\n`, 'stderr');
-    const actions = resolved.kind === 'bundled'
+    const actions = info.origin === 'bundled'
       ? ['Rebuild Desktop App (dev mode)', 'Dismiss']
       : ['Run Doctor', 'Dismiss'];
     void vscode.window
@@ -527,11 +435,4 @@ function raceExit(proc: StreamProcess, timeoutMs: number): Promise<boolean> {
     const timer = setTimeout(() => resolve(false), timeoutMs);
     proc.once('exit', () => { clearTimeout(timer); resolve(true); });
   });
-}
-
-function humanBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

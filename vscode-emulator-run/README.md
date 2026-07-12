@@ -2,7 +2,12 @@
 
 Run a Flutter app on a **remote** emulator/simulator with one click, BrowserStack-style. Your laptop only needs VS Code + this extension: it never runs `flutter`, `adb`, or `xcodebuild`.
 
-**Per-platform, fully offline packages.** Install the `.vsix` built for your OS/arch — it contains the streaming viewer and all native dependencies for that platform only. No downloads, no GitHub releases, no first-run installer. Each package is self-contained and typically tens of MB instead of a 300 MB universal bundle.
+**One `.vsix` per platform, fully offline.** Every release ships as a separate
+per-platform vsix (`win32-x64`, `darwin-arm64`, …). Each vsix contains **only**
+the streaming-viewer binary + native dependencies for its own platform, so
+installs stay modest (~20–60 MB) and the extension launches without any
+runtime download, cache, or external installer. VS Code enforces
+platform-vsix matching at install time.
 
 ## Architecture (thin-client model)
 
@@ -39,8 +44,7 @@ Run a Flutter app on a **remote** emulator/simulator with one click, BrowserStac
 
 The developer machine has **zero** dependencies beyond:
 * VS Code / Cursor
-* This extension (which auto-bundles the desktop-app streaming viewer)
-* .NET runtime (needed by the streaming viewer — installable in seconds)
+* The platform-specific `.vsix` for this machine
 
 Everything else — Flutter SDK, Android SDK, Xcode, adb, simctl, the Flutter project source, the device — lives on the **remote** host.
 
@@ -110,22 +114,26 @@ node server.js
 
 ## Developer-machine install (end user)
 
-**Install the `.vsix` built for your platform:**
+Pick the `.vsix` that matches YOUR host:
 
-| Your machine | VSIX file |
-| ------------ | --------- |
-| Windows 64-bit | `emulator-stream-run-<version>-win32-x64.vsix` |
-| Windows ARM64 | `emulator-stream-run-<version>-win32-arm64.vsix` |
-| Mac Apple Silicon | `emulator-stream-run-<version>-darwin-arm64.vsix` |
-| Mac Intel | `emulator-stream-run-<version>-darwin-x64.vsix` |
-| Linux x64 | `emulator-stream-run-<version>-linux-x64.vsix` |
-| Linux ARM64 | `emulator-stream-run-<version>-linux-arm64.vsix` |
+| Your OS + arch                | vsix file                                             |
+| ----------------------------- | ----------------------------------------------------- |
+| Windows 64-bit                | `emulator-stream-run-<version>-win32-x64.vsix`        |
+| Windows on ARM (Surface Pro)  | `emulator-stream-run-<version>-win32-arm64.vsix`      |
+| macOS Intel                   | `emulator-stream-run-<version>-darwin-x64.vsix`       |
+| macOS Apple Silicon (M1/M2/…) | `emulator-stream-run-<version>-darwin-arm64.vsix`     |
+| Linux 64-bit                  | `emulator-stream-run-<version>-linux-x64.vsix`        |
+| Linux ARM64                   | `emulator-stream-run-<version>-linux-arm64.vsix`      |
 
 ```bash
-code --install-extension emulator-stream-run-<version>-win32-x64.vsix
+code   --install-extension emulator-stream-run-<version>-<target>.vsix
+# or
+cursor --install-extension emulator-stream-run-<version>-<target>.vsix
 ```
 
-Then set your remote server in workspace settings:
+(You can also drag the `.vsix` into the VS Code / Cursor Extensions view.)
+
+Then in your workspace settings:
 
 ```json
 {
@@ -134,9 +142,14 @@ Then set your remote server in workspace settings:
 }
 ```
 
-Open any workspace and press **F5**. The bundled streaming viewer launches immediately — no network download step.
+Open any workspace and press **F5**. Everything the streaming viewer needs is
+inside the `.vsix` — no download, no first-run install, no cache, no external
+tooling required.
 
-Installing a `.vsix` built for a different platform (e.g. a Mac build on Windows) will fail with a clear error. Use the matching file from the table above.
+**Wrong-platform vsix?** VS Code refuses to install a `win32-x64` vsix on a Mac
+(and vice versa), with a clear "This extension is not compatible with this OS"
+error. If somehow a mismatched build ends up on the machine, F5 fails
+immediately with a diagnostics dump pointing at the correct vsix name.
 
 ## Developer-machine dev workflow (extension authors)
 
@@ -149,8 +162,8 @@ npm install         # postinstall publishes the streaming viewer into vendor/des
 
 `scripts/bootstrap.js`:
 1. Runs `dotnet publish -c Release -r <current-platform>` against `../EmulatorDesktopApp/`.
-2. Copies the publish output into `vendor/desktop-app/`.
-3. Writes `vendor/desktop-app/BUILD_INFO.json` so the extension can detect stale bundles at F5 time.
+2. Copies the publish output into `vendor/desktop-app/<current-rid>/`.
+3. Writes `BUILD_INFO.json` so the extension can detect stale bundles at F5 time.
 4. Symlinks `vscode-emulator-run/` into every detected `~/.vscode/extensions/` (and `~/.cursor/extensions/`, `.vscode-insiders`, …).
 
 Rebuild the streaming viewer after C# edits:
@@ -165,49 +178,44 @@ If the extension detects that the running viewer was built without the current f
 * **.NET 10 SDK** — for `dotnet publish`. Install: `brew install --cask dotnet-sdk` / `winget install Microsoft.DotNet.SDK.10`.
 * **Node.js ≥ 18**.
 
-## Building `.vsix` for distribution
+## Building `.vsix` for distribution (maintainers)
 
-Each command produces **one** platform-specific, fully offline package:
+One `.vsix` per platform, opt in per target:
 
 ```bash
 cd vscode-emulator-run
 
-# Current host platform:
-npm run package
+# Current host only (fast):
+npm run package                       # → dist/emulator-stream-run-<v>-<host-target>.vsix
 
 # A specific target:
-npm run package:win32-x64
+npm run package:win32-x64             # → dist/emulator-stream-run-<v>-win32-x64.vsix
 npm run package:win32-arm64
-npm run package:darwin-arm64
 npm run package:darwin-x64
+npm run package:darwin-arm64
 npm run package:linux-x64
 npm run package:linux-arm64
 
-# Every supported target in one go (from a Mac/Linux build machine):
-npm run package:all
+# Every supported target in one invocation:
+npm run package:all                   # → six .vsix files, one per platform
 ```
 
-Each invocation:
-1. Runs `dotnet publish -r <rid>` for that target only.
-2. Bundles Windows FFmpeg DLLs automatically for `win-*` targets.
-3. Copies the publish output into `vendor/desktop-app/` (flat layout — only that platform).
-4. Writes `vendor/desktop-app/BUILD_INFO.json`.
-5. Runs `vsce package --target <platform>` → `dist/emulator-stream-run-<version>-<target>.vsix`.
+Each `package:*` invocation:
 
-Each invocation prints a **size report** (folders ≥ 1 MB, files ≥ 500 KB, pruned files) and writes the VSIX to `dist/`.
+1. Wipes `vendor/desktop-app/` so nothing from a previous target leaks.
+2. Runs `dotnet publish -c Release -r <rid>` against `../EmulatorDesktopApp/`.
+3. For `win-*` RIDs, ensures the Gyan codexffmpeg 8.1 DLLs are present (either
+   from the MSBuild target, or fetched by `scripts/ensure-win-ffmpeg.js` as a
+   fallback).
+4. Writes `vendor/desktop-app/<rid>/BUILD_INFO.json` with the git sha + feature
+   contract.
+5. Runs `vsce package --target <vsce-target>` so the resulting vsix is tagged
+   for that platform.
 
-Typical compressed VSIX sizes after optimization:
+.NET SDK supports cross-RID publishing (`dotnet publish -r win-x64` on a Mac), so
+one macOS/Linux build machine can produce every artefact.
 
-| Platform | Approx. VSIX size | Notes |
-| -------- | ----------------- | ----- |
-| macOS arm64 | ~18 MB | No FFmpeg bundled (uses system libs at runtime on Mac dev; streaming decode path) |
-| Windows x64 | ~57 MB | Includes minimal FFmpeg decode DLLs (~108 MB uncompressed) + Avalonia/Skia |
-
-Windows is larger because FFmpeg H.264 decode libraries must ship inside the VSIX (macOS/Linux resolve FFmpeg from the host).
-
-### Cross-compiling from macOS
-
-.NET SDK can cross-publish Windows/Linux RIDs from a Mac. Running `npm run package:all` on a Mac produces all six `.vsix` files in a few minutes.
+`.vscodeignore` guarantees `vendor/desktop-app/` is INCLUDED and source/tests/scripts/node_modules are EXCLUDED.
 
 ## What F5 does end-to-end
 
@@ -263,8 +271,7 @@ The extension works without any `launch.json` — F5 in an empty workspace just 
 | `emulatorStreamRun.projectId` | *(empty)* | Pin a registered project id from the server's `flutter-projects.json`. Mutually exclusive with `projectPath`. |
 | `emulatorStreamRun.flavor` | *(empty)* | Pin a flavor name for the pinned project. Empty = interactive Quick Pick. |
 | `emulatorStreamRun.flutterPath` | *(empty)* | Advanced: `flutter` binary the remote should use for `projectPath` runs. |
-| `emulatorStreamRun.desktopAppPath` | *(empty)* | Advanced: absolute path to an EmulatorDesktopApp binary. Overrides the bundled copy inside the `.vsix`. |
-| `emulatorStreamRun.desktopAppRid` | *(empty)* | Advanced: force a specific .NET RID. Empty = auto-detect from `process.platform` / `process.arch`. |
+| `emulatorStreamRun.desktopAppPath` | *(empty)* | Advanced: absolute path to an `EmulatorDesktopApp[.exe]` binary to launch instead of the bundled one. |
 | `emulatorStreamRun.openStreamWindow` | `true` | Open the streaming window on `flutter_ready`. |
 | `emulatorStreamRun.stopGracePeriodMs` | `5000` | Wait window for the remote Flutter to exit gracefully before SIGTERM. |
 
@@ -272,34 +279,23 @@ Nothing about local Flutter paths, project paths, or flavor discovery — all of
 
 ## Troubleshooting
 
-Run **`Emulator Stream: Diagnose Desktop App`** from the Command Palette.
+### `Desktop app: (missing …)` at F5
 
-### `Desktop app: (not bundled — stream window will not open) [missing]`
+You installed the wrong platform-specific `.vsix`. Run **`Emulator Stream: Diagnose Desktop App`** from the Command Palette — the doctor prints exactly which `.vsix` to install (e.g. `emulator-stream-run-*-win32-x64.vsix`) and where the extension looked.
 
-The `.vsix` was built for a **different platform** or packaged without the desktop app.
+Common causes:
 
-Run the doctor command. Look for `likelyWrongPlatform` — it tells you which platform the bundled binary was built for vs. your host.
+* `.vsix` for another OS/arch got copied over — install the correct one.
+* Dev-mode symlink from an older layout — re-run `npm run bootstrap`.
+* Partial install / disk corruption — uninstall and reinstall the `.vsix`.
 
-Fix: install the correct `.vsix` for your machine (see the table in [Developer-machine install](#developer-machine-install-end-user)), or rebuild:
-
-```bash
-npm run package:win32-x64    # on Windows x64
-npm run package:darwin-arm64   # on Apple Silicon Mac
-```
-
-`npm run package:all` on a Mac build machine produces all six platform packages in one pass.
-
-### Windows: `Unable to find FFMPEG binaries`
-
-The Windows `.vsix` was built without FFmpeg DLLs (usually an old package from before the cross-compile fix). Rebuild with `npm run package:win32-x64` — the packaging script bundles `ffmpeg/win-x64/*.dll` automatically.
-
-### Extension activates but F5 never starts flutter
+### Extension activates but F5 never actually starts flutter
 
 The doctor covers the local side; server-side issues (device not found, project path missing) surface as WebSocket errors in the standard debug console. Look for lines prefixed `[remote]` — those come from the Node server on the remote host.
 
 ## Verifying the server side without a client
 
-Any WebSocket client can probe the new endpoints:
+Any WebSocket client can probe the endpoints:
 
 ```bash
 # Show configured projects (from flutter-projects.json)
@@ -318,24 +314,22 @@ wscat -c ws://REMOTE:8080
 ```
 vscode-emulator-run/
 ├── src/
-│   ├── extension.ts             activation + commands + status bar + installer singleton
+│   ├── extension.ts             activation + commands + status bar
 │   ├── debugAdapter.ts          inline DAP adapter (F5 entry point)
 │   ├── orchestrator.ts          device→(project|path)→run_flutter→attach hand-off
 │   ├── serverClient.ts          long-lived WS client (all remote calls)
-│   ├── settings.ts              config resolution
+│   ├── settings.ts              config resolution + bundled-binary lookup
 │   ├── devicePicker.ts          device Quick Pick
-│   ├── projectPicker.ts         project + flavor Quick Picks (both registered & ad-hoc)
+│   ├── projectPicker.ts         project + flavor Quick Picks
 │   ├── streamProcess.ts         spawn the streaming viewer
-│   ├── desktopAppFreshness.ts   BUILD_INFO.json parse + stale-bundle detection
-│   ├── desktopAppManifest.ts    PINNED_MANIFEST (legacy; unused in offline per-platform model)
-│   ├── desktopAppInstaller.ts   bundled-binary resolver (offline-only at F5 time)
-│   ├── doctorCommand.ts         Command Palette → diagnose the installer
+│   ├── desktopAppFreshness.ts   BUILD_INFO.json parse + wrong-platform diagnostics
+│   ├── doctorCommand.ts         Command Palette → diagnose the bundled binary
 │   └── rebuildCommand.ts        Command Palette → rerun bootstrap (dev mode only)
 ├── scripts/
 │   ├── bootstrap.js             dev workflow: publish + copy + symlink
-│   ├── package.js               per-platform offline vsix packager
-│   └── publish-desktop-app.js   optional remote-release helper (not used by default packaging)
-├── vendor/desktop-app/          (auto-generated) single-platform publish output + BUILD_INFO.json
-├── dist/                        (auto-generated) per-platform .vsix files
+│   ├── package.js               per-platform vsix packager (one target per invocation)
+│   └── ensure-win-ffmpeg.js     cross-compile fallback for Windows FFmpeg DLLs
+├── vendor/desktop-app/          per-RID subfolder for THIS build's target platform
+├── dist/                        (auto-generated) packaged .vsix files
 └── package.json
 ```

@@ -9,6 +9,7 @@
 # Source & build artefacts we don't need at runtime.
 src/**
 scripts/**
+dist/**
 tsconfig.json
 tsconfig.tsbuildinfo
 *.tsbuildinfo

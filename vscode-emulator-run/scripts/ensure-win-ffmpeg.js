@@ -5,8 +5,8 @@
  *
  * Cross-compiling win-x64 from macOS/Linux should pull these in via
  * FFmpeg.Windows.targets, but this script is a belt-and-suspenders fallback
- * used by package.js / publish-desktop-app.js when the MSBuild step was
- * skipped or failed silently (e.g. no network during dotnet publish).
+ * used by package.js when the MSBuild step was skipped or failed
+ * silently (e.g. no network during dotnet publish).
  */
 'use strict';
 
@@ -22,6 +22,9 @@ const REQUIRED_DLLS = [
   'swresample-6.dll',
   'swscale-9.dll',
   'avcodec-62.dll',
+  'avformat-62.dll',
+  'avfilter-11.dll',
+  'avdevice-62.dll',
 ];
 
 function winFfmpegDir(publishDir) {

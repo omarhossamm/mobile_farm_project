@@ -1,27 +1,43 @@
 #!/usr/bin/env node
 /**
- * Package the VS Code extension into one **platform-specific** `.vsix`.
+ * Package the VS Code extension into ONE .vsix per target platform.
  *
- * Each VSIX is fully offline and self-contained: it ships exactly one
- * `dotnet publish` output (plus Windows FFmpeg DLLs when applicable).
- * No other platform's binaries are included.
+ * Each .vsix contains ONLY the desktop-app binary + native
+ * dependencies for its own platform. There is no download step at
+ * runtime, no bundled multi-platform layout, no fallback binaries for
+ * other operating systems. The result is a modest per-platform .vsix
+ * (~20–60 MB) that installs and runs fully offline on the target
+ * machine.
  *
  * Usage:
  *
- *     node scripts/package.js                        # host platform
+ *     # One platform (defaults to the current host):
+ *     node scripts/package.js
+ *
+ *     # Specific target(s):
  *     node scripts/package.js --target win32-x64
- *     node scripts/package.js --target darwin-arm64
- *     node scripts/package.js --all                  # every supported target
- *     node scripts/package.js --universal            # one vsix: Windows + Mac
+ *     node scripts/package.js --target darwin-arm64,darwin-x64
  *
- * Output (one file per invocation):
+ *     # All supported targets in one invocation:
+ *     node scripts/package.js --all
  *
- *     dist/emulator-stream-run-<version>-<target>.vsix   (single-platform)
- *     dist/emulator-stream-run-<version>.vsix            (--universal)
+ * Supported target ids (vsce naming, matches VS Code marketplace):
  *
- * Examples:
- *     dist/emulator-stream-run-0.2.0-win32-x64.vsix
- *     dist/emulator-stream-run-0.2.0-darwin-arm64.vsix
+ *     win32-x64        (RID: win-x64)
+ *     win32-arm64      (RID: win-arm64)
+ *     darwin-x64       (RID: osx-x64)
+ *     darwin-arm64     (RID: osx-arm64)
+ *     linux-x64        (RID: linux-x64)
+ *     linux-arm64      (RID: linux-arm64)
+ *
+ * Output naming follows vsce convention:
+ *
+ *     dist/emulator-stream-run-<version>-<target>.vsix
+ *
+ * VS Code / Cursor only allow installing a target-specific .vsix on a
+ * host whose OS + arch matches — so shipping the wrong file to a
+ * developer produces a clear "unsupported platform" error at install
+ * time instead of a confusing missing-binary error at F5 time.
  */
 'use strict';
 
@@ -29,147 +45,98 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { ensureWinFfmpegInPublishDir, hasWinFfmpeg } = require('./ensure-win-ffmpeg');
-const { prunePublishDir } = require('./prune-publish');
-const { renderReport, formatBytes } = require('./size-report');
 
 const extensionRoot = path.resolve(__dirname, '..');
 const distDir = path.join(extensionRoot, 'dist');
 const vendorRoot = path.join(extensionRoot, 'vendor', 'desktop-app');
 const siblingDesktopApp = path.resolve(extensionRoot, '..', 'EmulatorDesktopApp');
 
-/** vsce --target value → .NET RID */
-const TARGET_TO_RID = {
-  'win32-x64': 'win-x64',
-  'win32-arm64': 'win-arm64',
-  'darwin-x64': 'osx-x64',
+/** vsce target id → .NET RID. Full universe of what we support. */
+const TARGETS = {
+  'win32-x64':    'win-x64',
+  'win32-arm64':  'win-arm64',
+  'darwin-x64':   'osx-x64',
   'darwin-arm64': 'osx-arm64',
-  'linux-x64': 'linux-x64',
-  'linux-arm64': 'linux-arm64',
+  'linux-x64':    'linux-x64',
+  'linux-arm64':  'linux-arm64',
 };
 
-const ALL_TARGETS = Object.keys(TARGET_TO_RID);
 const REQUIRED_DESKTOP_APP_FEATURES = ['headless-attach-v1'];
-/** Default RIDs bundled into `--universal` (one vsix for Mac + Windows). */
-const UNIVERSAL_TARGETS = ['win32-x64', 'darwin-arm64', 'darwin-x64'];
-const BEFORE_VSIX = path.join(distDir, 'emulator-stream-run-0.2.0-win32-x64.vsix');
-const BEFORE_BYTES = fs.existsSync(BEFORE_VSIX) ? fs.statSync(BEFORE_VSIX).size : null;
 
-const argv = process.argv.slice(2);
-const buildAll = argv.includes('--all');
-const buildUniversal = argv.includes('--universal');
-const targetIdx = argv.indexOf('--target');
-const explicitTarget = targetIdx >= 0 ? argv[targetIdx + 1] : null;
-
-let mode; // 'single' | 'all' | 'universal'
-let targets;
-
-if (buildUniversal) {
-  mode = 'universal';
-  targets = UNIVERSAL_TARGETS.slice();
-} else if (buildAll) {
-  mode = 'all';
-  targets = ALL_TARGETS.slice();
-} else if (explicitTarget) {
-  mode = 'single';
-  if (!TARGET_TO_RID[explicitTarget]) {
-    fatal(`Unknown --target "${explicitTarget}". Supported: ${ALL_TARGETS.join(', ')}`);
+const targetsRequested = parseTargets(process.argv.slice(2));
+if (targetsRequested.length === 0) {
+  fatal('No targets to build. Pass --target <id> or --all.');
+}
+for (const t of targetsRequested) {
+  if (!(t in TARGETS)) {
+    fatal(`Unknown target "${t}". Supported: ${Object.keys(TARGETS).join(', ')}`);
   }
-  targets = [explicitTarget];
-} else {
-  mode = 'single';
-  targets = [hostVsceTarget()];
 }
 
 fs.mkdirSync(distDir, { recursive: true });
 
-if (mode === 'universal') {
-  let allRemoved = [];
-  let outFile = '';
-  step(`Package universal (Mac + Windows)`, () => {
+// Compile ONCE at the top so every target reuses the same JS output.
+step('Compile TypeScript', () => {
+  fs.rmSync(path.join(extensionRoot, 'out'), { recursive: true, force: true });
+  const tscBin = path.join(extensionRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+  execFileSync(tscBin, ['-p', path.join(extensionRoot, 'tsconfig.json')], {
+    cwd: extensionRoot, stdio: 'inherit',
+  });
+});
+
+const results = [];
+for (const target of targetsRequested) {
+  const rid = TARGETS[target];
+  step(`Package ${target}  (rid=${rid})`, () => {
+    // Wipe vendor between each target so a stale binary from the
+    // previous iteration can never leak into the next .vsix. Each
+    // .vsix is exactly one platform.
     fs.rmSync(vendorRoot, { recursive: true, force: true });
     fs.mkdirSync(vendorRoot, { recursive: true });
-    const builds = [];
-    for (const vsceTarget of targets) {
-      const rid = TARGET_TO_RID[vsceTarget];
-      log(`── publish ${vsceTarget} (rid=${rid})`);
-      const removed = publishDesktopAppForRid(rid, path.join(vendorRoot, rid));
-      writeBuildInfo(path.join(vendorRoot, rid), rid);
-      allRemoved = allRemoved.concat(removed);
-      builds.push({ rid, vsceTarget });
-    }
-    writeSupportedRidsManifest(builds);
-    outFile = runVsceUniversal();
-    const report = renderReport({
-      label: 'SIZE REPORT — universal (Mac + Windows)',
-      vendorRoot,
-      vsixPath: outFile,
-      removed: allRemoved,
-    });
-    process.stdout.write(report + '\n');
+
+    const ridDir = path.join(vendorRoot, rid);
+    publishDesktopAppForRid(rid, ridDir);
+    writeBuildInfo(ridDir, rid);
+    writeSupportedRidsManifest([{ rid, features: REQUIRED_DESKTOP_APP_FEATURES.slice() }]);
+
+    const outFile = vsceOutName(target);
+    try { fs.unlinkSync(outFile); } catch { /* not present */ }
+    runVsce(target, outFile);
+    const sizeMB = (fs.statSync(outFile).size / (1024 * 1024)).toFixed(1);
+    results.push({ target, rid, outFile, sizeMB });
+    log(`→ ${path.relative(extensionRoot, outFile)}  (${sizeMB} MB)`);
   });
-} else {
-  for (const vsceTarget of targets) {
-    const rid = TARGET_TO_RID[vsceTarget];
-    let removed = [];
-    let outFile = '';
-    step(`Package for ${vsceTarget} (rid=${rid})`, () => {
-      fs.rmSync(vendorRoot, { recursive: true, force: true });
-      fs.mkdirSync(vendorRoot, { recursive: true });
-      removed = publishDesktopAppForRid(rid);
-      writeBuildInfo(vendorRoot, rid);
-      outFile = runVsce(vsceTarget);
-      const report = renderReport({
-        label: `SIZE REPORT — ${vsceTarget}`,
-        vendorRoot,
-        vsixPath: outFile,
-        removed,
-      });
-      process.stdout.write(report + '\n');
-    });
-  }
 }
 
-if (BEFORE_BYTES != null && mode === 'single' && targets.length === 1 && targets[0] === 'win32-x64') {
-  const afterPath = path.join(distDir, `emulator-stream-run-${readVersion()}-win32-x64.vsix`);
-  if (fs.existsSync(afterPath)) {
-    const after = fs.statSync(afterPath).size;
-    process.stdout.write(
-      `\nVSIX before optimization: ${formatBytes(BEFORE_BYTES)}\n` +
-      `VSIX after optimization:  ${formatBytes(after)} (${((1 - after / BEFORE_BYTES) * 100).toFixed(1)}% smaller)\n`
-    );
-  }
+process.stdout.write(`\n✓ done. Artefacts:\n`);
+for (const r of results) {
+  process.stdout.write(`   • ${r.target}  ${r.sizeMB} MB  →  ${path.relative(process.cwd(), r.outFile)}\n`);
 }
-
-process.stdout.write(`\n✓ done. Artefact(s) in ${distDir}\n`);
 
 // ── steps ───────────────────────────────────────────────────────────────
 
-function publishDesktopAppForRid(rid, destDir = vendorRoot) {
+function publishDesktopAppForRid(rid, ridDir) {
   if (!fs.existsSync(siblingDesktopApp)) {
     fatal(
-      `Cannot find ../EmulatorDesktopApp at ${siblingDesktopApp}. ` +
-      `This script requires the extension and the .NET project side-by-side.`
+      `Cannot find ../EmulatorDesktopApp at ${siblingDesktopApp}. This packaging ` +
+      `script only works from a source checkout with the extension and the .NET ` +
+      `project side-by-side.`
     );
   }
   log(`dotnet publish -c Release -r ${rid}`);
   execFileSync(
     'dotnet',
-    [
-      'publish', '-c', 'Release', '-r', rid,
-      '--self-contained', 'false',
-      '-p:UseAppHost=true',
-      '-p:DebugType=none',
-      '-p:DebugSymbols=false',
-      '-p:CopyDebugSymbolFilesFromPackages=false',
-      '-p:InvariantGlobalization=true',
-      '-p:PublishReadyToRun=false',
-    ],
+    ['publish', '-c', 'Release', '-r', rid, '--self-contained', 'false', '-p:UseAppHost=true'],
     { cwd: siblingDesktopApp, stdio: 'inherit' }
   );
   const targetFramework = readTargetFramework(siblingDesktopApp);
   const publishDir = path.join(siblingDesktopApp, 'bin', 'Release', targetFramework, rid, 'publish');
   if (!fs.existsSync(publishDir)) fatal(`publish output missing at ${publishDir}`);
 
+  // Cross-compilation belt-and-suspenders: FFmpeg.Windows.targets normally
+  // pulls the Gyan FFmpeg DLLs during dotnet publish, but if that MSBuild
+  // step is skipped (network hiccup, offline mode, older SDK) we fill in
+  // the gap here so the win-* .vsix ships with a working FFmpeg.
   if (rid === 'win-x64' || rid === 'win-arm64') {
     ensureWinFfmpegInPublishDir(publishDir);
     if (!hasWinFfmpeg(publishDir)) {
@@ -177,53 +144,16 @@ function publishDesktopAppForRid(rid, destDir = vendorRoot) {
     }
   }
 
-  const prune = prunePublishDir(publishDir, rid);
-  log(`pruned publish output: ${formatBytes(prune.beforeBytes)} → ${formatBytes(prune.afterBytes)} (${prune.removed.length} files)`);
-
-  copyRecursive(publishDir, destDir);
-  log(`copied ${publishDir} → ${destDir}`);
-  return prune.removed;
-}
-
-function writeSupportedRidsManifest(builds) {
-  const manifest = {
-    schemaVersion: 1,
-    createdAt: new Date().toISOString(),
-    rids: builds.map((b) => ({ rid: b.rid, vsceTarget: b.vsceTarget })),
-  };
-  fs.writeFileSync(
-    path.join(vendorRoot, 'SUPPORTED_RIDS.json'),
-    JSON.stringify(manifest, null, 2) + '\n'
-  );
-  log(`wrote SUPPORTED_RIDS.json (${builds.length} platforms)`);
-}
-
-function runVsceUniversal() {
-  fs.rmSync(path.join(extensionRoot, 'out'), { recursive: true, force: true });
-
-  const tscBin = path.join(extensionRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
-  execFileSync(tscBin, ['-p', path.join(extensionRoot, 'tsconfig.json')], {
-    cwd: extensionRoot, stdio: 'inherit',
-  });
-
-  const version = readVersion();
-  const outFile = path.join(distDir, `emulator-stream-run-${version}.vsix`);
-  try { fs.unlinkSync(outFile); } catch { /* not present */ }
-
-  const vsceBin = path.join(extensionRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'vsce.cmd' : 'vsce');
-  execFileSync(
-    vsceBin,
-    ['package', '--out', outFile, '--allow-star-activation'],
-    { cwd: extensionRoot, stdio: 'inherit' }
-  );
-  log(`→ ${outFile}`);
-  return outFile;
+  fs.rmSync(ridDir, { recursive: true, force: true });
+  fs.mkdirSync(ridDir, { recursive: true });
+  copyRecursive(publishDir, ridDir);
+  log(`copied ${publishDir} → ${ridDir}`);
 }
 
 function writeBuildInfo(dir, rid) {
   let gitSha = null;
   try {
-    gitSha = execFileSync('git', ['rev-parse', 'short', 'HEAD'], {
+    gitSha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
       cwd: extensionRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
   } catch { /* not a repo */ }
@@ -240,36 +170,60 @@ function writeBuildInfo(dir, rid) {
   log(`wrote BUILD_INFO.json (${gitSha ?? 'no-git'} for ${rid})`);
 }
 
-function runVsce(vsceTarget) {
-  fs.rmSync(path.join(extensionRoot, 'out'), { recursive: true, force: true });
+function writeSupportedRidsManifest(builds) {
+  const manifest = {
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    rids: builds.map((b) => ({ rid: b.rid, features: b.features })),
+  };
+  fs.writeFileSync(
+    path.join(vendorRoot, 'SUPPORTED_RIDS.json'),
+    JSON.stringify(manifest, null, 2) + '\n'
+  );
+}
 
-  const tscBin = path.join(extensionRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
-  execFileSync(tscBin, ['-p', path.join(extensionRoot, 'tsconfig.json')], {
-    cwd: extensionRoot, stdio: 'inherit',
-  });
-
+function vsceOutName(target) {
   const version = readVersion();
-  const outFile = path.join(distDir, `emulator-stream-run-${version}-${vsceTarget}.vsix`);
-  try { fs.unlinkSync(outFile); } catch { /* not present */ }
+  return path.join(distDir, `emulator-stream-run-${version}-${target}.vsix`);
+}
 
+function runVsce(target, outFile) {
   const vsceBin = path.join(extensionRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'vsce.cmd' : 'vsce');
   execFileSync(
     vsceBin,
-    ['package', '--target', vsceTarget, '--out', outFile, '--allow-star-activation'],
+    ['package', '--target', target, '--out', outFile, '--allow-star-activation'],
     { cwd: extensionRoot, stdio: 'inherit' }
   );
-  log(`→ ${outFile}`);
-  return outFile;
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
-function hostVsceTarget() {
+function parseTargets(argv) {
+  if (argv.includes('--all')) return Object.keys(TARGETS);
+
+  const collected = new Set();
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--target') {
+      const val = argv[i + 1];
+      if (!val) fatal(`--target requires a value`);
+      val.split(',').map((s) => s.trim()).filter(Boolean).forEach((t) => collected.add(t));
+      i++;
+    } else if (arg.startsWith('--target=')) {
+      arg.slice('--target='.length).split(',').map((s) => s.trim()).filter(Boolean).forEach((t) => collected.add(t));
+    }
+  }
+
+  if (collected.size === 0) collected.add(currentTarget());
+  return Array.from(collected);
+}
+
+function currentTarget() {
   const platform = process.platform;
   const arch = process.arch;
   if (platform === 'darwin') return arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64';
-  if (platform === 'linux')  return arch === 'arm64' ? 'linux-arm64' : 'linux-x64';
-  if (platform === 'win32')  return arch === 'arm64' ? 'win32-arm64' : 'win32-x64';
+  if (platform === 'linux')  return arch === 'arm64' ? 'linux-arm64'  : 'linux-x64';
+  if (platform === 'win32')  return arch === 'arm64' ? 'win32-arm64'  : 'win32-x64';
   fatal(`unsupported host platform: ${platform}/${arch}`);
 }
 

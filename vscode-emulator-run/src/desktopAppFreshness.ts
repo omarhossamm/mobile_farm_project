@@ -16,10 +16,8 @@ export const REQUIRED_DESKTOP_APP_FEATURES = ['headless-attach-v1'] as const;
 
 export type DesktopAppOrigin =
   | 'user-setting'    // user pointed at a specific binary via emulatorStreamRun.desktopAppPath
-  | 'bundled'         // ../vendor/desktop-app/ — baked into the .vsix at package time (dev-mode or --bundle vsix)
-  | 'cached'          // installer's global-storage cache — extracted from a previously-downloaded archive
-  | 'downloaded'      // just fetched over the network in this session
-  | 'missing';        // nothing found and no way to get it — extension is malformed / no-network
+  | 'bundled'         // ../vendor/desktop-app/<rid>/ — baked into the .vsix at package time
+  | 'missing';        // nothing found — install the platform-specific .vsix for this host
 
 export interface BuildInfo {
   builtAt?: string;
@@ -194,12 +192,6 @@ export function stalenessReason(info: DesktopAppInfo): string {
         return `The bundled EmulatorDesktopApp binary was built without the following required feature(s): ${info.missingFeatures.join(', ')}. Install the newer version of the extension (.vsix) that includes the matching desktop app.`;
       }
       return '';
-    case 'cached':
-    case 'downloaded':
-      if (info.missingFeatures.length > 0) {
-        return `The downloaded EmulatorDesktopApp is missing required feature(s): ${info.missingFeatures.join(', ')}. Run "Emulator Stream: Redownload Desktop App" to fetch a fresh copy, or update the pinned manifest.`;
-      }
-      return '';
     case 'user-setting':
       return '';
   }
@@ -234,37 +226,33 @@ function missingReason(info: DesktopAppInfo): string {
     `(${d.extensionPlatform}, RID=${d.hostRid}). ` +
     `Extension expected: ${d.expectedBinaryName} inside ${d.ridSubdir}.`;
 
-  // Case 1 — vendor dir absent.
-  //
-  // With the download-on-first-run distribution this is the EXPECTED
-  // state before the installer runs. The message points at the network
-  // path (which handles it) rather than at rebuilding the .vsix.
+  const vscePlatform = ridToVscePlatform(d.hostRid) ?? d.hostRid;
+  const rebuildHint =
+    `Install the platform-specific .vsix for this host — ` +
+    `\`npm run package:${vscePlatform}\` on the build machine, then ` +
+    `\`code --install-extension emulator-stream-run-*-${vscePlatform}.vsix\` here.`;
+
+  // Case 1 — vendor dir absent. The .vsix was packaged without any
+  // desktop-app binary at all (broken package.js run, or the extension
+  // was installed from source without a bootstrap).
   if (!d.vendorExists) {
-    return (
-      `${header} No bundled binary in the extension (slim vsix). ` +
-      `The installer will download it on first launch from the pinned URL, ` +
-      `unless the manifest has not been published yet — see the ` +
-      `"Emulator Stream: Doctor" command output for the download URL and ` +
-      `\`emulatorStreamRun.desktopAppBaseUrl\` setting.`
-    );
+    return `${header} vendor/desktop-app/ is missing from this install. ${rebuildHint}`;
   }
 
-  // Case 2 — multi-platform bundle, but host RID absent.
+  // Case 2 — wrong-platform .vsix installed.
   if (d.availableRids.length > 0 && !d.availableRids.includes(d.hostRid)) {
     const ridList = d.availableRids.join(', ');
     const overrideHint = d.ridOverride
       ? ` (you have emulatorStreamRun.desktopAppRid="${d.ridOverride}"; clear that setting to auto-detect)`
       : '';
     return (
-      `${header} The bundle ships EmulatorDesktopApp for [${ridList}] ` +
-      `but NOT for ${d.hostRid}${overrideHint}. ` +
-      `Rebuild the .vsix on a machine that can cross-compile for ` +
-      `${d.hostRid} (\`npm run package\` with ${d.hostRid} in the ` +
-      `PLATFORM_RIDS list) and reinstall.`
+      `${header} This .vsix was built for [${ridList}] but NOT for ${d.hostRid}${overrideHint}. ` +
+      `You installed the wrong platform-specific .vsix. ${rebuildHint}`
     );
   }
 
-  // Case 3 — legacy flat bundle for the wrong platform.
+  // Case 3 — legacy flat bundle for the wrong platform (kept for
+  // back-compat with old dev-mode symlinks).
   if (d.likelyWrongPlatform && d.availableRids.length === 0) {
     const forBits = d.likelyWrongPlatform.installedFor
       ? ` (looks like a build for ${d.likelyWrongPlatform.installedFor}`
@@ -272,13 +260,12 @@ function missingReason(info: DesktopAppInfo): string {
         + ')'
       : '';
     return (
-      `${header} vendor/desktop-app/ contains a single-platform (legacy) ` +
-      `bundle for a different host${forBits}. Rebuild with \`npm run package\` — ` +
-      `the new bundle ships every supported platform in one .vsix.`
+      `${header} vendor/desktop-app/ contains a single-platform bundle ` +
+      `for a different host${forBits}. ${rebuildHint}`
     );
   }
 
-  // Case 4 — host RID subdir exists but the binary is missing.
+  // Case 4 — host RID subdir exists but the binary is missing (partial extraction).
   if (d.ridSubdirExists) {
     const contentsPreview = (d.ridSubdirContents ?? []).slice(0, 20).join(', ');
     return (
@@ -289,15 +276,28 @@ function missingReason(info: DesktopAppInfo): string {
     );
   }
 
-  // Catch-all — vendor dir present but neither layout matches. Show
-  // what IS at the vendor root so the user can spot the mismatch.
+  // Catch-all.
   const rootPreview = (d.vendorContents ?? []).slice(0, 20).join(', ');
   return (
     `${header} vendor/desktop-app/ contents: [${rootPreview}` +
-    `${(d.vendorContents?.length ?? 0) > 20 ? ', …' : ''}]. ` +
-    `Neither the per-RID subdir nor the legacy flat layout is usable. ` +
-    `Rebuild with \`npm run package\` and reinstall.`
+    `${(d.vendorContents?.length ?? 0) > 20 ? ', …' : ''}]. ${rebuildHint}`
   );
+}
+
+/**
+ * Local copy of the RID → vsce target mapping. Duplicated here to
+ * keep desktopAppFreshness free of any dependency on settings.ts.
+ */
+function ridToVscePlatform(rid: string): string | undefined {
+  const map: Record<string, string> = {
+    'win-x64': 'win32-x64',
+    'win-arm64': 'win32-arm64',
+    'osx-x64': 'darwin-x64',
+    'osx-arm64': 'darwin-arm64',
+    'linux-x64': 'linux-x64',
+    'linux-arm64': 'linux-arm64',
+  };
+  return map[rid];
 }
 
 /**

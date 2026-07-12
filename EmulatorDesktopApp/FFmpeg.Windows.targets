@@ -24,14 +24,30 @@
       <Output TaskParameter="Lines" ItemName="_ExistingFfmpegStamp" />
     </ReadLinesFromFile>
 
+    <!-- Every DLL the runtime loader needs at App start. Missing any one of these
+         means we must re-download; a partial extract from a previous run is a
+         common failure mode (network hiccup while unzipping). -->
     <ItemGroup>
-      <_Ffmpeg81Avutil Include="$(FFmpegDestDir)avutil-60.dll" />
-      <_Ffmpeg81Avcodec Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <_Ffmpeg81Avutil     Include="$(FFmpegDestDir)avutil-60.dll" />
+      <_Ffmpeg81Avcodec    Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <_Ffmpeg81Avformat   Include="$(FFmpegDestDir)avformat-62.dll" />
+      <_Ffmpeg81Avfilter   Include="$(FFmpegDestDir)avfilter-11.dll" />
+      <_Ffmpeg81Avdevice   Include="$(FFmpegDestDir)avdevice-62.dll" />
+      <_Ffmpeg81Swresample Include="$(FFmpegDestDir)swresample-6.dll" />
+      <_Ffmpeg81Swscale    Include="$(FFmpegDestDir)swscale-9.dll" />
     </ItemGroup>
 
     <PropertyGroup>
       <_ExistingFfmpegStampValue Condition="'@(_ExistingFfmpegStamp)' != ''">@(_ExistingFfmpegStamp)</_ExistingFfmpegStampValue>
-      <_FfmpegBundleValid Condition="'@(_Ffmpeg81Avutil)' != '' and '@(_Ffmpeg81Avcodec)' != '' and '$(_ExistingFfmpegStampValue)' == '$(FFmpegBundleStamp)'">true</_FfmpegBundleValid>
+      <_FfmpegBundleValid Condition="
+          '@(_Ffmpeg81Avutil)'     != '' and
+          '@(_Ffmpeg81Avcodec)'    != '' and
+          '@(_Ffmpeg81Avformat)'   != '' and
+          '@(_Ffmpeg81Avfilter)'   != '' and
+          '@(_Ffmpeg81Avdevice)'   != '' and
+          '@(_Ffmpeg81Swresample)' != '' and
+          '@(_Ffmpeg81Swscale)'    != '' and
+          '$(_ExistingFfmpegStampValue)' == '$(FFmpegBundleStamp)'">true</_FfmpegBundleValid>
     </PropertyGroup>
 
     <Message Importance="high" Text="[FFmpeg] Bundle OK — skipping download." Condition="'$(_FfmpegBundleValid)' == 'true'" />
@@ -112,12 +128,15 @@
       <_FfmpegPublishDll Include="$(FFmpegDestDir)swresample-6.dll" />
       <_FfmpegPublishDll Include="$(FFmpegDestDir)swscale-9.dll" />
       <_FfmpegPublishDll Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)avformat-62.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)avfilter-11.dll" />
+      <_FfmpegPublishDll Include="$(FFmpegDestDir)avdevice-62.dll" />
       <ResolvedFileToPublish Include="@(_FfmpegPublishDll)">
         <RelativePath>ffmpeg/win-x64/%(Filename)%(Extension)</RelativePath>
         <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </ResolvedFileToPublish>
     </ItemGroup>
-    <Message Importance="high" Text="[FFmpeg] Added 4 DLL(s) to publish manifest under ffmpeg/win-x64/" />
+    <Message Importance="high" Text="[FFmpeg] Added 7 DLL(s) to publish manifest under ffmpeg/win-x64/" />
   </Target>
 
   <Target Name="_CopyFfmpegNativeToOutputImpl">
@@ -126,6 +145,9 @@
       <_FfmpegNativeDll Include="$(FFmpegDestDir)swresample-6.dll" />
       <_FfmpegNativeDll Include="$(FFmpegDestDir)swscale-9.dll" />
       <_FfmpegNativeDll Include="$(FFmpegDestDir)avcodec-62.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avformat-62.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avfilter-11.dll" />
+      <_FfmpegNativeDll Include="$(FFmpegDestDir)avdevice-62.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avutil-*.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avcodec-*.dll" />
       <_StaleFfmpegOutRootDll Include="$(OutDir)avformat-*.dll" />
@@ -141,6 +163,6 @@
           DestinationFolder="$(FFmpegOutDir)"
           SkipUnchangedFiles="false"
           OverwriteReadOnlyFiles="true" />
-    <Message Importance="high" Text="[FFmpeg] Copied 4 DLL(s) to $(FFmpegOutDir)" />
+    <Message Importance="high" Text="[FFmpeg] Copied 7 DLL(s) to $(FFmpegOutDir)" />
   </Target>
 </Project>

@@ -40,11 +40,6 @@
         "command": "emulatorStreamRun.doctor",
         "title": "Emulator Stream: Diagnose Desktop App",
         "category": "Emulator Stream"
-      },
-      {
-        "command": "emulatorStreamRun.redownloadDesktopApp",
-        "title": "Emulator Stream: Redownload Desktop App",
-        "category": "Emulator Stream"
       }
     ],
     "configuration": {
@@ -78,31 +73,7 @@
         "emulatorStreamRun.desktopAppPath": {
           "type": "string",
           "default": "",
-          "description": "Advanced: absolute path to an EmulatorDesktopApp binary to launch. Overrides the download-on-first-run resolver. Leave empty to let the extension auto-download the correct platform binary and cache it (recommended)."
-        },
-        "emulatorStreamRun.desktopAppRid": {
-          "type": "string",
-          "default": "",
-          "enum": [
-            "",
-            "win-x64",
-            "win-arm64",
-            "osx-x64",
-            "osx-arm64",
-            "linux-x64",
-            "linux-arm64"
-          ],
-          "description": "Advanced: force the extension to install a specific desktop-app RID (from the pinned release manifest). Leave empty for automatic detection (recommended). Useful edge cases: force osx-x64 on an Apple Silicon Mac to run under Rosetta 2, or pin a specific arch inside a container."
-        },
-        "emulatorStreamRun.desktopAppBaseUrl": {
-          "type": "string",
-          "default": "",
-          "description": "Advanced: override the base URL the extension downloads the EmulatorDesktopApp archive from. Leave empty to use the pinned URL that shipped with this extension version (typically the maintainer's GitHub Releases). Set this to a self-hosted mirror if your network can't reach the pinned URL."
-        },
-        "emulatorStreamRun.autoUpdateDesktopApp": {
-          "type": "boolean",
-          "default": true,
-          "description": "When true, the extension checks for newer compatible desktop-app releases in the background and downloads them into the cache. The currently-running binary is never swapped mid-run — the next launch picks up the newer version if the check succeeded. Set to false to freeze the desktop app at the version pinned in this extension."
+          "description": "Advanced: absolute path to an EmulatorDesktopApp binary to launch instead of the one bundled inside this .vsix. Leave empty to use the bundled binary (recommended)."
         },
         "emulatorStreamRun.openStreamWindow": {
           "type": "boolean",
@@ -239,20 +210,16 @@
     "bootstrap": "node scripts/bootstrap.js",
     "postinstall": "node scripts/bootstrap.js",
     "package": "node scripts/package.js",
-    "package:universal": "node scripts/package.js --universal",
-    "package:all": "node scripts/package.js --all",
     "package:win32-x64": "node scripts/package.js --target win32-x64",
     "package:win32-arm64": "node scripts/package.js --target win32-arm64",
-    "package:darwin-arm64": "node scripts/package.js --target darwin-arm64",
     "package:darwin-x64": "node scripts/package.js --target darwin-x64",
+    "package:darwin-arm64": "node scripts/package.js --target darwin-arm64",
     "package:linux-x64": "node scripts/package.js --target linux-x64",
     "package:linux-arm64": "node scripts/package.js --target linux-arm64",
-    "publish-desktop-app": "node scripts/publish-desktop-app.js",
+    "package:all": "node scripts/package.js --all",
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
-    "@types/adm-zip": "^0.5.8",
-    "adm-zip": "^0.5.18",
     "ws": "^8.16.0"
   },
   "devDependencies": {

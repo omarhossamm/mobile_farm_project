@@ -10,7 +10,6 @@ import {
   readBuildInfo,
   statMtime,
 } from './desktopAppFreshness';
-import { PINNED_MANIFEST } from './desktopAppManifest';
 export type { DesktopAppInfo } from './desktopAppFreshness';
 
 /**
@@ -18,18 +17,23 @@ export type { DesktopAppInfo } from './desktopAppFreshness';
  * Exported so diagnostic commands + doctor UI can point at the same
  * folder without duplicating this bit of layout knowledge.
  *
- * The vsix layout (per-platform offline bundle) is flat:
+ * The vsix layout (as of the multi-platform bundle) is:
  *
  *   vendor/desktop-app/
- *   ├── EmulatorDesktopApp[.exe]
- *   ├── BUILD_INFO.json
- *   ├── ffmpeg/win-x64/…        (Windows only)
- *   └── … (other native deps for this platform only)
+ *   ├── SUPPORTED_RIDS.json     ← top-level manifest (RIDs + build info)
+ *   ├── win-x64/
+ *   │   ├── EmulatorDesktopApp.exe
+ *   │   └── BUILD_INFO.json
+ *   ├── osx-arm64/
+ *   │   ├── EmulatorDesktopApp
+ *   │   └── BUILD_INFO.json
+ *   └── … (one subdir per built RID)
  *
- * Each platform-specific `.vsix` ships exactly one publish output.
- * Runtime resolution: look for `vendor/desktop-app/EmulatorDesktopApp[.exe]`.
- * A legacy per-RID subfolder (`vendor/desktop-app/<rid>/`) is still
- * accepted for older packages.
+ * Runtime resolution: derive the RID from `process.platform` /
+ * `process.arch` (with an optional user override), look inside
+ * `vendor/desktop-app/<rid>/`. For back-compat with legacy vsix files
+ * built before the multi-platform layout, we also try the flat
+ * `vendor/desktop-app/EmulatorDesktopApp[.exe]` path as a fallback.
  *
  * `__dirname` at runtime is `<extension>/out/`; the compiled JS lives
  * one level below the extension root.
@@ -98,14 +102,14 @@ export function findBundledDesktopApp(
   const rid = currentRid(options.rid);
   const expected = expectedBinaryName();
 
-  // ── Probe A: flat layout (per-platform offline VSIX). ─────────────
-  const legacyPath = path.join(root, expected);
-
-  // ── Probe B: per-RID subdirectory (legacy multi-RID bundles). ──
+  // ── Probe A: per-RID subdirectory (multi-platform bundle). ──────
   const ridDir = path.join(root, rid);
   const ridPath = path.join(ridDir, expected);
 
-  const probedPaths = [legacyPath, ridPath];
+  // ── Probe B: flat legacy layout. ───────────────────────────────
+  const legacyPath = path.join(root, expected);
+
+  const probedPaths = [ridPath, legacyPath];
 
   const rootExists = safeIsDir(root);
   const rootContents = rootExists ? safeReaddir(root) : undefined;
@@ -129,20 +133,15 @@ export function findBundledDesktopApp(
     likelyWrongPlatform: undefined,   // filled below only if we hit the missing branch
   };
 
-  // Prefer per-RID subdirectory when this bundle ships multiple platforms.
-  if (availableRids.length > 1 && safeIsFile(ridPath)) {
-    return { path: ridPath, diagnostics };
-  }
-
-  // Flat layout (single-platform offline VSIX).
-  if (safeIsFile(legacyPath)) {
-    return { path: legacyPath, diagnostics };
-  }
-
-  // Per-RID subdirectory (universal or legacy bundles).
+  // Prefer the per-RID location.
   if (safeIsFile(ridPath)) {
-    diagnostics.legacyFallbackUsed = true;
     return { path: ridPath, diagnostics };
+  }
+
+  // Fall back to the legacy flat layout.
+  if (safeIsFile(legacyPath)) {
+    diagnostics.legacyFallbackUsed = true;
+    return { path: legacyPath, diagnostics };
   }
 
   // Missing — enrich diagnostics with a guess at what happened.
@@ -265,33 +264,13 @@ void os;
 export interface ResolvedSettings {
   server: string;
   /**
-   * PRELIMINARY resolution — reflects only what the extension can
-   * determine synchronously from a bundled fallback or an explicit
-   * `desktopAppPath` override. First-run installs live in the
-   * installer's cache and only become visible AFTER the orchestrator
-   * calls `installer.ensure()`; until then `origin` may be
-   * `'missing'` even though the binary is about to be downloaded.
-   *
-   * Use `settings.desktopApp` for logging + doctor introspection.
-   * Use the value returned by `installer.ensure()` for spawning.
+   * Fully-resolved desktop app info — reflects either the user
+   * override (`desktopAppPath`) or the bundled binary shipped inside
+   * this .vsix for the current host platform. There is no runtime
+   * download: if neither source produces a binary, `origin` is
+   * `'missing'` and the launch will fail with a clear error.
    */
   desktopApp: DesktopAppInfo;
-  /**
-   * The user-configurable base URL for downloading the desktop-app
-   * archive. Empty string = accept whatever the pinned manifest
-   * defaults to (typically the maintainer's GitHub Releases).
-   */
-  desktopAppBaseUrl: string;
-  /**
-   * Explicit RID override for the installer (Rosetta 2, cross-arch
-   * containers, …). Empty = auto-detect from process.platform/arch.
-   */
-  desktopAppRid: string;
-  /**
-   * When set, extension will silently download newer compatible
-   * versions in the background and cache them for next-launch use.
-   */
-  autoUpdateDesktopApp: boolean;
   openStreamWindow: boolean;
   stopGracePeriodMs: number;
   device?: string;
@@ -355,12 +334,8 @@ export function resolveSettings(
     server: firstNonEmpty([launchConfig.server, cfg.get<string>('server')]) ?? 'ws://127.0.0.1:8080',
     desktopApp: resolveDesktopApp(
       cfg.get<string>('desktopAppPath') ?? '',
-      cfg.get<string>('desktopAppRid') ?? '',
       workspaceFolder,
     ),
-    desktopAppBaseUrl: (cfg.get<string>('desktopAppBaseUrl') ?? '').trim(),
-    desktopAppRid: (cfg.get<string>('desktopAppRid') ?? '').trim(),
-    autoUpdateDesktopApp: cfg.get<boolean>('autoUpdateDesktopApp') ?? true,
     openStreamWindow: firstDefined([launchConfig.openStreamWindow, cfg.get<boolean>('openStreamWindow')]) ?? true,
     stopGracePeriodMs: cfg.get<number>('stopGracePeriodMs') ?? 5000,
     device: launchConfig.device?.trim() || undefined,
@@ -383,25 +358,22 @@ function firstDefined<T>(values: (T | undefined)[]): T | undefined {
 }
 
 /**
- * Resolution is intentionally strict:
+ * Resolution is intentionally strict — two rungs, no network:
  *
  *   1. `emulatorStreamRun.desktopAppPath` — advanced override, trusted
- *      as-is (no freshness check). Only ever meant for a developer
- *      pointing at a locally-built binary while iterating on the
- *      desktop app itself.
- *   2. `<extension>/vendor/desktop-app/EmulatorDesktopApp[.exe]` —
- *      the canonical path. `.vsix` packaging bakes this into every
- *      installed copy of the extension, so `origin=bundled` is the
- *      only sanctioned state at end-user runtime.
+ *      as-is (no freshness check). Meant for a developer iterating on
+ *      the desktop app itself.
+ *   2. `<extension>/vendor/desktop-app/<rid>/EmulatorDesktopApp[.exe]`
+ *      — the canonical path. Every `.vsix` is built for exactly one
+ *      RID by `scripts/package.js`, so `origin=bundled` is the only
+ *      sanctioned state at end-user runtime.
  *
- * No workspace-adjacent fallback anymore. Version mismatches from
- * "someone had a stale `dotnet publish` output on their machine" were
- * the #1 cause of head-scratchers in the two-machine setup, and the
- * whole point of `.vsix` self-containment is to make that impossible.
+ * If neither source resolves, `origin=missing` and F5 fails with a
+ * diagnostics dump pointing the user at the correct platform-specific
+ * .vsix. No downloads, no fallbacks to other platforms' binaries.
  */
 function resolveDesktopApp(
   setting: string,
-  ridOverride: string | undefined,
   workspaceFolder?: vscode.WorkspaceFolder,
 ): DesktopAppInfo {
   const expanded = setting ? expandVars(setting, workspaceFolder) : '';
@@ -412,7 +384,7 @@ function resolveDesktopApp(
       }
     } catch { /* fall through — user pointed at a non-existent path */ }
   }
-  const found = findBundledDesktopApp({ rid: ridOverride });
+  const found = findBundledDesktopApp();
   if (found.path) return buildInfoFor(found.path, 'bundled', found.diagnostics);
   return {
     path: undefined,
@@ -436,30 +408,6 @@ function buildInfoFor(
     missingFeatures: origin === 'user-setting' ? [] : findMissingFeatures(buildInfo),
     diagnostics,
   };
-}
-
-/**
- * Post-install: build a DesktopAppInfo from whatever the installer
- * resolved. Called by the orchestrator (once ensure() returns) and by
- * the doctor command. The `previous` diagnostics are folded in so
- * bundled-layout diagnostics keep bubbling up even after a cache hit
- * decides which binary to run.
- */
-export function buildInfoForResolvedSource(
-  binaryPath: string,
-  origin: DesktopAppOrigin,
-  previous?: DesktopAppInfo,
-): DesktopAppInfo {
-  return buildInfoFor(binaryPath, origin, previous?.diagnostics);
-}
-
-/**
- * The pinned desktop-app version this extension expects. Re-exported
- * here so orchestrator / doctor code doesn't need to import the
- * manifest module directly.
- */
-export function requiredDesktopAppVersion(): string {
-  return PINNED_MANIFEST.requiredVersion;
 }
 
 function expandVars(value: string, workspaceFolder?: vscode.WorkspaceFolder): string {

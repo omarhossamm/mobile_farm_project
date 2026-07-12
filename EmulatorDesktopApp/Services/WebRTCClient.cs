@@ -323,10 +323,11 @@ namespace EmulatorDesktopApp.Services
             }
         }
 
-        /// <summary>Decode-only FFmpeg DLLs (H.264 WebRTC via SIPSorcery). Load order: deps first.</summary>
+        /// <summary>Load order for Gyan codexffmpeg 8.1 shared DLLs (dependencies first).</summary>
         private static readonly string[] WindowsFfmpegLoadOrder =
         {
-            "avutil-60.dll", "swresample-6.dll", "swscale-9.dll", "avcodec-62.dll",
+            "avutil-60.dll", "swresample-6.dll", "swscale-9.dll",
+            "avcodec-62.dll", "avformat-62.dll", "avfilter-11.dll", "avdevice-62.dll"
         };
 
         private static readonly string[] WindowsRequiredFfmpegDlls = WindowsFfmpegLoadOrder;

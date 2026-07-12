@@ -4,43 +4,15 @@ import type { LaunchConfig } from './settings';
 import { fetchDevices } from './serverClient';
 import { registerRebuildCommand } from './rebuildCommand';
 import { registerDoctorCommand } from './doctorCommand';
-import { DesktopAppInstaller, currentRid } from './desktopAppInstaller';
 
 const DEBUG_TYPE = 'emulator-stream';
 const RUN_COMMAND = 'emulatorStreamRun.run';
 
 let statusBarItem: vscode.StatusBarItem | undefined;
 let extensionContext: vscode.ExtensionContext | undefined;
-/**
- * Process-wide installer singleton. Owns the in-flight download map,
- * the lock file table, and the background updater state. Constructed
- * once on activate() and reused for every F5 + doctor invocation.
- */
-let installer: DesktopAppInstaller | undefined;
-
-/** Accessor for other modules that want the installer without going through activate(). */
-export function getDesktopAppInstaller(): DesktopAppInstaller {
-  if (!installer) throw new Error('DesktopAppInstaller accessed before extension activated');
-  return installer;
-}
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
-  installer = new DesktopAppInstaller();
-
-  // Ensure the global-storage folder exists BEFORE anyone tries to
-  // write into it. VS Code doesn't create this lazily.
-  try {
-    require('fs').mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
-  } catch { /* best effort */ }
-
-  // Background downloads are disabled for the offline per-platform VSIX
-  // distribution model. The bundled binary inside vendor/desktop-app/ is
-  // the only supported source at F5 time.
-  void installer.checkForUpdatesInBackground({
-    cacheRoot: context.globalStorageUri.fsPath,
-    enabled: false,
-  });
 
   const provider = new EmulatorStreamConfigProvider();
   context.subscriptions.push(
@@ -79,11 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   extensionContext = undefined;
-  installer = undefined;
 }
-
-// Suppress unused warning while keeping the export ergonomic.
-void currentRid;
 
 // ── Commands ────────────────────────────────────────────────────────────
 

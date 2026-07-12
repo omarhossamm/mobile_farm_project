@@ -55,8 +55,6 @@ step(`Publish EmulatorDesktopApp for this platform (${targetFramework ?? '?'})`,
   if (!targetFramework) {
     fatal('Could not read <TargetFramework> from EmulatorDesktopApp.csproj');
   }
-  // Match production packaging: flat vendor/desktop-app/ with only this
-  // platform's publish output (EmulatorDesktopApp[.exe], native libs, …).
   const rid = detectDotnetRid();
   log(`publishing for ${rid}…`);
   execFileSync(
@@ -68,20 +66,17 @@ step(`Publish EmulatorDesktopApp for this platform (${targetFramework ?? '?'})`,
   if (!fs.existsSync(publishDir)) {
     fatal(`publish output missing at ${publishDir}`);
   }
-  if (rid === 'win-x64' || rid === 'win-arm64') {
-    const { ensureWinFfmpegInPublishDir, hasWinFfmpeg } = require('./ensure-win-ffmpeg');
-    ensureWinFfmpegInPublishDir(publishDir);
-    if (!hasWinFfmpeg(publishDir)) {
-      fatal(`Windows FFmpeg DLLs missing in ${publishDir}/ffmpeg/win-x64`);
-    }
-  }
-  const { prunePublishDir } = require('./prune-publish');
-  prunePublishDir(publishDir, rid);
+  // Match the production packaging layout: per-RID subdir under
+  // vendor/desktop-app/. Keeps the runtime resolver code path
+  // identical for dev and prod (no legacy fallback needed on the
+  // developer's machine).
+  const ridDir = path.join(vendorRoot, rid);
   fs.rmSync(vendorRoot, { recursive: true, force: true });
-  fs.mkdirSync(vendorRoot, { recursive: true });
-  copyRecursive(publishDir, vendorRoot);
-  writeBuildInfo(vendorRoot, rid);
-  log(`bundled desktop app → ${vendorRoot}`);
+  fs.mkdirSync(ridDir, { recursive: true });
+  copyRecursive(publishDir, ridDir);
+  writeBuildInfo(ridDir, rid);
+  writeSupportedRidsManifest([{ rid, features: REQUIRED_DESKTOP_APP_FEATURES.slice() }]);
+  log(`bundled desktop app → ${ridDir}`);
 });
 
 step('Compile extension', () => {

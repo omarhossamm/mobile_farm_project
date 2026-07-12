@@ -1,9 +1,8 @@
 import * as vscode from 'vscode';
-import { Orchestrator, type DesktopAppEnvironment } from './orchestrator';
+import { Orchestrator } from './orchestrator';
 import { resolveSettings, type LaunchConfig } from './settings';
 import { DeviceInUseError } from './devicePicker';
 import { formatDiagnosticsReport } from './desktopAppFreshness';
-import { getDesktopAppInstaller } from './extension';
 
 /**
  * Inline Debug Adapter.
@@ -69,16 +68,14 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
     const config = (msg.arguments ?? {}) as LaunchConfig;
     const settings = resolveSettings(config, this.workspaceFolder);
     this.info(`Server:          ${settings.server}`);
-    // The preliminary desktopApp path may still be undefined at this
-    // point — that's normal for a slim vsix, the installer will
-    // resolve/download later. We just log what we already know.
-    const previewPath = settings.desktopApp.path ?? '(will download on demand)';
+    // Every .vsix is platform-specific — the desktop app either
+    // resolved to a bundled binary for this host, or resolution
+    // already failed at this stage.
+    const previewPath = settings.desktopApp.path ?? '(missing — see diagnostics below)';
     this.info(`Desktop app:     ${previewPath} [${settings.desktopApp.origin}]`);
     if (settings.desktopApp.origin === 'missing') {
-      // Missing at THIS point isn't necessarily an error anymore — a
-      // slim vsix legitimately starts here. Print the diagnostics
-      // report so users can see the intended cache location and
-      // download URL if they need to intervene.
+      // Print the full diagnostics dump up-front so the user doesn't
+      // have to open the doctor command to see what went wrong.
       this.info(formatDiagnosticsReport(settings.desktopApp));
     }
     if (settings.device)    this.info(`Pinned device:   ${settings.device}`);
@@ -86,8 +83,7 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
     if (settings.flavor)    this.info(`Pinned flavor:   ${settings.flavor}`);
 
     const workspaceKey = this.workspaceFolder?.uri.toString() ?? 'default';
-    const desktopEnv = this.buildDesktopEnv();
-    const orchestrator = new Orchestrator(workspaceKey, this.context?.workspaceState, desktopEnv);
+    const orchestrator = new Orchestrator(workspaceKey, this.context?.workspaceState);
     this.orchestrator = orchestrator;
 
     orchestrator.on('output', (line: string, category: 'stdout' | 'stderr' | 'console') => {
@@ -150,25 +146,6 @@ export class EmulatorStreamAdapter implements vscode.DebugAdapter {
 
   private info(line: string): void {
     this.sendEvent('output', { category: 'console', output: line + '\n' });
-  }
-
-  /**
-   * Bundle the installer + cache/extension paths in a shape the
-   * orchestrator can consume without needing its own reference to
-   * `vscode.ExtensionContext`. Returns undefined when the extension
-   * hasn't gotten a context yet (unit-test entrypoint).
-   */
-  private buildDesktopEnv(): DesktopAppEnvironment | undefined {
-    if (!this.context) return undefined;
-    try {
-      return {
-        installer: getDesktopAppInstaller(),
-        extensionRoot: this.context.extensionUri.fsPath,
-        cacheRoot: this.context.globalStorageUri.fsPath,
-      };
-    } catch {
-      return undefined;
-    }
   }
 }
 
