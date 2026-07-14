@@ -5,11 +5,11 @@
 
 const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
+const { getAdbPath, resolveAdbPath } = require('./lib/resolveAdb');
 
 const execAsync = promisify(exec);
 
 // Configuration
-const ADB_PATH = process.env.ADB_PATH || 'adb';
 const COMMAND_TIMEOUT = parseInt(process.env.ADB_TIMEOUT, 10) || 30000;
 
 /**
@@ -37,7 +37,8 @@ const logger = {
  */
 async function executeCommand(command, options = {}) {
   const { timeout = COMMAND_TIMEOUT } = options;
-  const fullCommand = `${ADB_PATH} ${command}`;
+  const adbBin = getAdbPath();
+  const fullCommand = `"${adbBin}" ${command}`;
   
   logger.debug(`Executing command: ${fullCommand}`);
   
@@ -281,18 +282,45 @@ async function rebootDevice(deviceId, mode = 'system') {
  * @returns {Promise<{available: boolean, version?: string, error?: string}>}
  */
 async function checkAdbAvailable() {
-  const result = await executeCommand('version');
-  
-  if (!result.success) {
-    return { available: false, error: result.error };
+  const resolved = resolveAdbPath();
+  if (!resolved.found) {
+    return {
+      available: false,
+      error: `ADB not found (tried ADB_PATH, PATH, ANDROID_HOME, and common SDK locations). Last path tried: ${resolved.path}`,
+      adbPath: resolved.path,
+      source: resolved.source
+    };
   }
-  
+
+  const result = await executeCommand('version');
+
+  if (!result.success) {
+    return {
+      available: false,
+      error: result.error,
+      adbPath: resolved.path,
+      source: resolved.source
+    };
+  }
+
   const versionMatch = result.output.match(/Android Debug Bridge version ([\d.]+)/);
   const version = versionMatch ? versionMatch[1] : 'unknown';
-  
-  logger.info('ADB is available', { version });
-  
-  return { available: true, version };
+
+  // Propagate so child processes / other modules reading env see the same binary.
+  process.env.ADB_PATH = resolved.path;
+
+  logger.info('ADB is available', {
+    version,
+    adbPath: resolved.path,
+    source: resolved.source
+  });
+
+  return {
+    available: true,
+    version,
+    adbPath: resolved.path,
+    source: resolved.source
+  };
 }
 
 /**
@@ -344,7 +372,7 @@ function streamCommand(deviceId, command, onData, onError) {
   
   logger.info('Starting streaming command', { deviceId, command });
   
-  const process = spawn(ADB_PATH, args);
+  const process = spawn(getAdbPath(), args);
   
   process.stdout.on('data', (data) => {
     if (onData) onData(data.toString());

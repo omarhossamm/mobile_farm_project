@@ -137,7 +137,10 @@ const streamConfig = {
   keyframesOnly: envBool('STREAM_KEYFRAMES_ONLY', false),
   useTestPattern: process.env.USE_TEST_PATTERN === 'true',
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
-  adbPath: process.env.ADB_PATH || 'adb'
+  // Resolved dynamically at load (ADB_PATH → PATH → ANDROID_HOME → common SDK paths).
+  get adbPath() {
+    return require('./resolveAdb').getAdbPath();
+  }
 };
 
 function resolveStreamOptions(overrides = {}) {

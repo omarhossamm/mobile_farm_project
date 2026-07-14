@@ -1208,13 +1208,21 @@ async function handleMessage(session, rawMessage) {
  * Create and start the WebSocket server
  */
 async function startServer() {
-  // Check ADB availability
+  // Check ADB availability (resolves ADB_PATH / PATH / common SDK locations)
   const adbCheck = await adb.checkAdbAvailable();
   if (!adbCheck.available) {
-    logger.error('ADB is not available. Please ensure ADB is installed and in PATH.');
+    logger.error('ADB is not available. Install Android SDK platform-tools, or set ADB_PATH / ANDROID_HOME.', {
+      adbPath: adbCheck.adbPath,
+      source: adbCheck.source,
+      error: adbCheck.error,
+      hint: 'Windows: usually %LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe'
+    });
     process.exit(1);
   }
-  logger.info(`ADB version: ${adbCheck.version}`);
+  logger.info(`ADB version: ${adbCheck.version}`, {
+    adbPath: adbCheck.adbPath,
+    source: adbCheck.source
+  });
   
   // Check emulator availability (optional)
   const emulatorCheck = await emulator.checkEmulatorAvailable();

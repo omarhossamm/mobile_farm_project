@@ -3,7 +3,7 @@
  * Handles WebSocket client sessions and device mappings
  */
 
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 /**
  * Logger utility for consistent logging format
@@ -257,7 +257,7 @@ class SessionManager {
    * @returns {Session} - The created session
    */
   createSession(ws) {
-    const sessionId = uuidv4();
+    const sessionId = randomUUID();
     const session = new Session(sessionId, ws);
     
     this.sessions.set(sessionId, session);
