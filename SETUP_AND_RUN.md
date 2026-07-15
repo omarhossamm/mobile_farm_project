@@ -35,9 +35,9 @@ remote_debug_desktop/
 ├── EmulatorDesktopApp/            .NET 10 / Avalonia GUI (client-side)
 ├── websocket_nodejs/
 │   └── adb-emulator-server/       Node.js WebSocket + WebRTC server
-├── vscode-emulator-run/           VS Code extension (source lives on
-│                                   the `vs_code_extension` branch)
 ├── tools/GeometryParity/          .NET CLI: coord-mapping parity check
+│                                  (VS Code extension source lives on the
+│                                   `vs_code_extension` branch — not present here)
 ├── SERVER.md                      Server handover doc
 ├── DESKTOP_APP.md                 Desktop app handover doc
 └── SETUP_AND_RUN.md               This file

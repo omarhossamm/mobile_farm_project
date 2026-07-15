@@ -5,7 +5,6 @@
 
 const { EventEmitter } = require('events');
 const { peerConnectionManager } = require('./webrtc/PeerConnection');
-const { createCapture } = require('./capture/factory');
 const {
   H264RtpPacketizer,
   processH264Chunk,

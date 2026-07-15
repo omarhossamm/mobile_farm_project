@@ -3,12 +3,9 @@
  */
 
 const { streamManager } = require('./StreamManager');
-const { peerConnectionManager, getCodecName } = require('./webrtc/PeerConnection');
-const { createCapture } = require('./capture/factory');
+const { peerConnectionManager } = require('./webrtc/PeerConnection');
 
 module.exports = {
   streamManager,
-  peerConnectionManager,
-  createCapture,
-  getCodecName
+  peerConnectionManager
 };

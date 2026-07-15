@@ -3,7 +3,7 @@
  * Provides async functions for interacting with Android Debug Bridge (ADB)
  */
 
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const { promisify } = require('util');
 const { getAdbPath, resolveAdbPath } = require('./lib/resolveAdb');
 
@@ -115,84 +115,6 @@ function mapDeviceStatus(rawStatus) {
     'sideload': 'sideload'
   };
   return statusMap[rawStatus] || rawStatus || 'unknown';
-}
-
-/**
- * Get list of available Android Virtual Devices (emulators)
- * @returns {Promise<{success: boolean, emulators: Array<{name: string}>, error?: string}>}
- */
-async function getAvailableEmulators() {
-  const emulatorPath = process.env.EMULATOR_PATH || 'emulator';
-  
-  logger.info('Fetching available AVDs');
-  
-  try {
-    const { stdout, stderr } = await execAsync(`${emulatorPath} -list-avds`, {
-      timeout: COMMAND_TIMEOUT
-    });
-    
-    if (stderr && !stderr.includes('WARNING')) {
-      logger.debug('Emulator command stderr', { stderr: stderr.trim() });
-    }
-    
-    const emulators = stdout
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => {
-        // Filter out empty lines and INFO/WARNING/ERROR messages
-        if (line.length === 0) return false;
-        if (line.startsWith('INFO')) return false;
-        if (line.startsWith('WARNING')) return false;
-        if (line.startsWith('ERROR')) return false;
-        if (line.includes('crashdata')) return false;
-        return true;
-      })
-      .map(name => ({ name }));
-    
-    logger.info(`Found ${emulators.length} AVD(s)`, { emulators });
-    
-    return { success: true, emulators };
-  } catch (error) {
-    logger.error('Failed to list AVDs', { error: error.message });
-    
-    // Check if emulator command is not found
-    if (error.message.includes('not found') || error.message.includes('ENOENT')) {
-      return {
-        success: false,
-        emulators: [],
-        error: 'Emulator command not found. Ensure Android SDK emulator is installed and in PATH.'
-      };
-    }
-    
-    return {
-      success: false,
-      emulators: [],
-      error: error.message
-    };
-  }
-}
-
-/**
- * Execute a shell command on a specific device
- * @param {string} deviceId - The device ID to target
- * @param {string} shellCommand - The shell command to execute
- * @returns {Promise<{success: boolean, output: string, error?: string}>}
- */
-async function shellCommand(deviceId, shellCommand) {
-  if (!deviceId) {
-    return { success: false, output: '', error: 'Device ID is required' };
-  }
-  
-  if (!shellCommand) {
-    return { success: false, output: '', error: 'Shell command is required' };
-  }
-  
-  // Sanitize command to prevent injection
-  const sanitizedCommand = sanitizeCommand(shellCommand);
-  
-  logger.info(`Executing shell command on device ${deviceId}`, { command: sanitizedCommand });
-  
-  return await executeCommand(`-s ${deviceId} ${sanitizedCommand}`);
 }
 
 /**
@@ -324,17 +246,6 @@ async function checkAdbAvailable() {
 }
 
 /**
- * Wait for a device to be connected
- * @param {number} timeout - Maximum time to wait in milliseconds
- * @returns {Promise<{success: boolean, error?: string}>}
- */
-async function waitForDevice(timeout = 60000) {
-  logger.info(`Waiting for device connection (timeout: ${timeout}ms)`);
-  
-  return await executeCommand('wait-for-device', { timeout });
-}
-
-/**
  * Sanitize shell command to prevent injection
  * @param {string} command - The command to sanitize
  * @returns {string} - Sanitized command
@@ -359,48 +270,13 @@ function sanitizeCommand(command) {
   return command;
 }
 
-/**
- * Stream long-running ADB command output
- * @param {string} deviceId - The device ID to target
- * @param {string} command - The ADB command to execute
- * @param {function} onData - Callback for data events
- * @param {function} onError - Callback for error events
- * @returns {ChildProcess} - The spawned process
- */
-function streamCommand(deviceId, command, onData, onError) {
-  const args = deviceId ? ['-s', deviceId, ...command.split(' ')] : command.split(' ');
-  
-  logger.info('Starting streaming command', { deviceId, command });
-  
-  const process = spawn(getAdbPath(), args);
-  
-  process.stdout.on('data', (data) => {
-    if (onData) onData(data.toString());
-  });
-  
-  process.stderr.on('data', (data) => {
-    if (onError) onError(data.toString());
-  });
-  
-  process.on('error', (error) => {
-    logger.error('Streaming command error', { error: error.message });
-    if (onError) onError(error.message);
-  });
-  
-  return process;
-}
-
 module.exports = {
   executeCommand,
   getDevices,
-  getAvailableEmulators,
-  shellCommand,
   deviceCommand,
   installApk,
   takeScreenshot,
   rebootDevice,
   checkAdbAvailable,
-  waitForDevice,
-  streamCommand,
   logger
 };

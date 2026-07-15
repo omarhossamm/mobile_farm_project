@@ -286,41 +286,6 @@ async function getEmulatorStatus() {
 }
 
 /**
- * Wait for emulator to finish booting
- * @param {string} deviceId - The device ID to wait for
- * @param {number} timeout - Maximum time to wait in milliseconds
- * @returns {Promise<{success: boolean, error?: string}>}
- */
-async function waitForBoot(deviceId, timeout = 120000) {
-  logger.info(`Waiting for emulator boot: ${deviceId}`);
-  
-  const startTime = Date.now();
-  const pollInterval = 3000;
-  
-  return new Promise((resolve) => {
-    const checkBoot = async () => {
-      if (Date.now() - startTime > timeout) {
-        resolve({ success: false, error: 'Boot timeout exceeded' });
-        return;
-      }
-      
-      // Check boot completed property
-      const result = await adb.shellCommand(deviceId, 'shell getprop sys.boot_completed');
-      
-      if (result.success && result.output.trim() === '1') {
-        logger.info(`Emulator boot completed: ${deviceId}`);
-        resolve({ success: true });
-        return;
-      }
-      
-      setTimeout(checkBoot, pollInterval);
-    };
-    
-    checkBoot();
-  });
-}
-
-/**
  * Check if emulator command is available
  * @returns {Promise<{available: boolean, error?: string}>}
  */
@@ -335,41 +300,12 @@ async function checkEmulatorAvailable() {
   }
 }
 
-/**
- * Snapshot management - save snapshot
- * @param {string} deviceId - The device ID
- * @param {string} snapshotName - Name for the snapshot
- * @returns {Promise<{success: boolean, error?: string}>}
- */
-async function saveSnapshot(deviceId, snapshotName) {
-  logger.info(`Saving snapshot: ${snapshotName}`, { deviceId });
-  
-  const result = await adb.executeCommand(`-s ${deviceId} emu avd snapshot save ${snapshotName}`);
-  return result;
-}
-
-/**
- * Snapshot management - load snapshot
- * @param {string} deviceId - The device ID
- * @param {string} snapshotName - Name of the snapshot to load
- * @returns {Promise<{success: boolean, error?: string}>}
- */
-async function loadSnapshot(deviceId, snapshotName) {
-  logger.info(`Loading snapshot: ${snapshotName}`, { deviceId });
-  
-  const result = await adb.executeCommand(`-s ${deviceId} emu avd snapshot load ${snapshotName}`);
-  return result;
-}
-
 module.exports = {
   listAvailableEmulators,
   startEmulator,
   stopEmulator,
   stopAllEmulators,
   getEmulatorStatus,
-  waitForBoot,
   checkEmulatorAvailable,
-  saveSnapshot,
-  loadSnapshot,
   logger
 };
