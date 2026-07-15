@@ -24,7 +24,7 @@ Desktop.ini
 # Cursor local state (not project source)
 .cursor/
 
-# --- .NET / Avalonia (EmulatorDesktopApp) ---
+# --- .NET / Avalonia (MobileStreamDesktop) ---
 [Bb]in/
 [Oo]bj/
 [Ll]og/
@@ -58,7 +58,7 @@ apphost
 project.assets.json
 project.nuget.cache
 
-# --- Node.js (websocket_nodejs / adb-emulator-server) ---
+# --- Node.js (MobileStreamServer) ---
 node_modules/
 npm-debug.log*
 yarn-debug.log*

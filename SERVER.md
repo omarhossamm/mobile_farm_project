@@ -1,6 +1,6 @@
 # SERVER
 
-`websocket_nodejs/adb-emulator-server` — Node.js WebSocket gateway that owns
+`MobileStreamServer` — Node.js WebSocket gateway that owns
 the physical/virtual devices, streams their screens via WebRTC, and forwards
 touch/keyboard input back.
 
@@ -73,7 +73,7 @@ flowchart LR
 ## 4. Folder structure
 
 ```
-adb-emulator-server/
+MobileStreamServer/
 ├── server.js                    Entry point + all WebSocket handlers
 ├── sessionManager.js            Session + device-reservation registry
 ├── emulatorManager.js           Android AVD lifecycle
@@ -266,7 +266,7 @@ next to `server.js` if enabled — see §14.
 ## 12. How to start the server
 
 ```bash
-cd websocket_nodejs/adb-emulator-server
+cd MobileStreamServer
 npm install
 node server.js                   # or: npm start   |   npm run dev (with --watch)
 ```

@@ -1,6 +1,6 @@
 # DESKTOP APP
 
-`EmulatorDesktopApp/` — Cross-platform Avalonia / .NET 10 GUI that mirrors
+`MobileStreamDesktop/` — Cross-platform Avalonia / .NET 10 GUI that mirrors
 a remote device in real time and forwards touch/keyboard input.
 
 ---
@@ -58,12 +58,12 @@ is opened programmatically only when a stream is running.
 ## 4. Folder structure
 
 ```
-EmulatorDesktopApp/
+MobileStreamDesktop/
 ├── Program.cs                       Avalonia entry point
 ├── App.axaml(.cs)                   App shell — instantiates MainWindow
 ├── MainWindow.axaml(.cs)            Control panel (connect / devices / logs)
 ├── StreamWindow.axaml(.cs)          Live-mirror window + touch/keyboard
-├── EmulatorDesktopApp.csproj        .NET project + packages
+├── MobileStreamDesktop.csproj        .NET project + packages
 ├── FFmpeg.Windows.targets           MSBuild target: auto-downloads FFmpeg 8.1 DLLs
 ├── app.manifest                     Windows DPI + UAC manifest
 ├── Services/
@@ -195,8 +195,8 @@ Sent as either:
 - **`FFmpeg.Windows.targets`** auto-downloads
   [`ffmpeg-8.1-full_build-shared.zip`](https://github.com/GyanD/codexffmpeg/releases/tag/8.1)
   on first Windows build, caches under
-  `%LOCALAPPDATA%\EmulatorDesktopApp\ffmpeg-cache`, and copies the 7 DLLs
-  into `EmulatorDesktopApp\ffmpeg\win-x64\`. Validated by checking all
+  `%LOCALAPPDATA%\MobileStreamDesktop\ffmpeg-cache`, and copies the 7 DLLs
+  into `MobileStreamDesktop\ffmpeg\win-x64\`. Validated by checking all
   seven files are present before considering the bundle valid.
 - **`app.manifest`** sets DPI awareness and a matching UAC execution level.
 - **`<OutputType>WinExe</OutputType>`** hides the Windows console.
@@ -267,7 +267,7 @@ the UI text field. (An extension-integrated variant with
 **Dev run**
 
 ```bash
-cd EmulatorDesktopApp
+cd MobileStreamDesktop
 dotnet run
 ```
 
@@ -296,10 +296,10 @@ a Windows host, or copy the `ffmpeg\win-x64\` folder manually beside the
 **macOS `.app` bundle** (correct Dock icon)
 
 ```bash
-cd EmulatorDesktopApp
+cd MobileStreamDesktop
 chmod +x scripts/package-macos-app.sh
 ./scripts/package-macos-app.sh
-open bin/Release/net10.0/osx-arm64/EmulatorDesktopApp.app
+open bin/Release/net10.0/osx-arm64/MobileStreamDesktop.app
 ```
 
 **Environment overrides**

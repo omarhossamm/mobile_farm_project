@@ -18,7 +18,7 @@ There are two roles. They can be the **same machine** for development.
 - `idb` (`pip install fb-idb`) for iOS input + iOS fallback capture.
 - Xcode command-line tools with `swiftc` to build the iOS capture helper.
 - A `scrcpy-server.jar` (v2.7) for Android capture — checked in at
-  `websocket_nodejs/adb-emulator-server/scrcpy/scrcpy-server.jar`.
+  `MobileStreamServer/scrcpy/scrcpy-server.jar`.
 
 ### Client machine (developer)
 - .NET 10 SDK (to build the desktop app) — or an already-published binary.
@@ -32,10 +32,9 @@ There are two roles. They can be the **same machine** for development.
 
 ```
 remote_debug_desktop/
-├── EmulatorDesktopApp/            .NET 10 / Avalonia GUI (client-side)
-├── websocket_nodejs/
-│   └── adb-emulator-server/       Node.js WebSocket + WebRTC server
-├── tools/GeometryParity/          .NET CLI: coord-mapping parity check
+├── MobileStreamDesktop/            .NET 10 / Avalonia GUI (client-side)
+├── MobileStreamServer/             Node.js WebSocket + WebRTC server
+├── tools/GeometryParity/           .NET CLI: coord-mapping parity check
 │                                  (VS Code extension source lives on the
 │                                   `vs_code_extension` branch — not present here)
 ├── SERVER.md                      Server handover doc
@@ -67,7 +66,7 @@ cd remote_debug_desktop
 ### 4a. Server
 
 ```bash
-cd websocket_nodejs/adb-emulator-server
+cd MobileStreamServer
 npm install
 ```
 
@@ -99,7 +98,7 @@ cp .env.example .env
 ### 4b. Desktop app
 
 ```bash
-cd EmulatorDesktopApp
+cd MobileStreamDesktop
 dotnet restore
 dotnet build
 ```
@@ -143,7 +142,7 @@ Output: `vscode-emulator-run/dist/emulator-stream-run-<version>-<target>.vsix`.
 ## 5. Run the server
 
 ```bash
-cd websocket_nodejs/adb-emulator-server
+cd MobileStreamServer
 node server.js
 # or:  npm start        (equivalent)
 # or:  npm run dev      (uses `node --watch`)
@@ -185,7 +184,7 @@ Configure `emulatorStreamRun.server` in Settings to the server URL
 Dev run:
 
 ```bash
-cd EmulatorDesktopApp
+cd MobileStreamDesktop
 dotnet run
 ```
 
@@ -200,16 +199,16 @@ dotnet publish -c Release -r osx-x64   --self-contained true   # macOS Intel
 macOS `.app` bundle (proper Dock icon):
 
 ```bash
-cd EmulatorDesktopApp
+cd MobileStreamDesktop
 chmod +x scripts/package-macos-app.sh
 ./scripts/package-macos-app.sh
-open bin/Release/net10.0/osx-arm64/EmulatorDesktopApp.app
+open bin/Release/net10.0/osx-arm64/MobileStreamDesktop.app
 ```
 
 ⚠️ Windows FFmpeg DLLs are only auto-copied when the build **host** is
 Windows. Cross-publishing a Windows RID from macOS/Linux does not bundle
 the DLLs on this branch — build on a Windows machine or copy the
-`ffmpeg\win-x64\` folder manually beside `EmulatorDesktopApp.exe`.
+`ffmpeg\win-x64\` folder manually beside `MobileStreamDesktop.exe`.
 
 ## 8. Connect everything together
 
@@ -276,14 +275,14 @@ sequenceDiagram
 | `Device X is already in use by another user` | Another live session owns it | Pick a different device, or close the other session |
 | Client connects but "No devices returned" | Server started before devices were plugged in / booted | Boot the AVD / plug in the device, then click **Refresh** |
 | Stream never starts (`stall_no_data`) on Android | Orphaned scrcpy or screenrecord on the device | Restart the stream — the server auto-kills orphans on the next `start_stream`. Manually: `adb shell pkill -KILL screenrecord scrcpy` |
-| iOS simulator capture fails | `coresim-capture` helper not built | `cd websocket_nodejs/adb-emulator-server/stream/capture/ios/coresim-capture && bash build.sh` |
+| iOS simulator capture fails | `coresim-capture` helper not built | `cd MobileStreamServer/stream/capture/ios/coresim-capture && bash build.sh` |
 | iOS capture falls back to laggy `idb-transcode` | `coresim-capture` present but VideoToolbox rejected the pixel format | Check server logs; ensure the simulator is booted and visible to `xcrun simctl` |
 | Windows desktop app: `Unable to find FFMPEG binaries` | The 7 Gyan codexffmpeg DLLs are missing next to the `.exe` | Rebuild on a Windows machine, OR manually place the 8.1 `full_build-shared` DLLs into `<exe dir>\ffmpeg\win-x64\`, OR set `FFMPEG_LIB_PATH` |
 | Windows desktop app crashes at startup with missing `vcruntime140.dll` | VC++ x64 redistributable not installed | Install [VC++ 2015–2022 x64 redist](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 | macOS desktop app: FFmpeg not found | Homebrew FFmpeg missing or in an unusual location | `brew install ffmpeg`, or set `FFMPEG_LIB_PATH` |
 | macOS desktop app runs but Dock icon is generic | Launching the raw binary, not the `.app` bundle | Run `scripts/package-macos-app.sh` and open the `.app` |
 | Extension: `Unsupported platform` at install | Wrong-platform `.vsix` | Install the matching `<target>.vsix` for your OS/arch |
-| Extension: `The bundled EmulatorDesktopApp binary is missing` | Same as above, discovered at F5 time | Install the correct platform `.vsix`, or set `emulatorStreamRun.desktopAppPath` to a locally-built binary |
+| Extension: `The bundled MobileStreamDesktop binary is missing` | Same as above, discovered at F5 time | Install the correct platform `.vsix`, or set `emulatorStreamRun.desktopAppPath` to a locally-built binary |
 | Connection works locally but not across LAN | Firewall / STUN | Open TCP 8080 on the server; enable `USE_STUN_SERVERS=true` and open UDP ports if going across NAT |
 | Stream starts but black screen / `videoRtp=0` / ICE failed | WebRTC UDP blocked or wrong network path | **Do not use Cloudflare/ngrok for video** — they only proxy WebSocket. Use `ws://<server-lan-ip>:8080` with both machines on the **same LAN**. If the Mac has multiple NICs (Wi‑Fi + hotspot), set `WEBRTC_ANNOUNCE_IPS=<lan-ip>` before starting the server |
 | Server log: `sent: 0` / `DTLS not ready` | ICE/DTLS never completed | Same as above — client cannot reach server's UDP candidates. Restart server after setting `WEBRTC_ANNOUNCE_IPS` |

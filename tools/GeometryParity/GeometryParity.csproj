@@ -6,7 +6,7 @@
     transform is provably identical on both ends.
     Run via: dotnet run on this project.
 
-    NOTE: lives OUTSIDE EmulatorDesktopApp so the app's SDK glob never compiles
+    NOTE: lives OUTSIDE MobileStreamDesktop so the app's SDK glob never compiles
     this project's sources or generated obj files.
   -->
   <PropertyGroup>
@@ -20,7 +20,7 @@
 
   <ItemGroup>
     <!-- Link the production geometry math directly — no copy, no drift. -->
-    <Compile Include="../../EmulatorDesktopApp/Services/GeometryModel.cs" />
+    <Compile Include="../../MobileStreamDesktop/Services/GeometryModel.cs" />
   </ItemGroup>
 
 </Project>

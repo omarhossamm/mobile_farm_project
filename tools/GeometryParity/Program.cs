@@ -1,5 +1,5 @@
 using System.Text.Json;
-using EmulatorDesktopApp.Services;
+using MobileStreamDesktop.Services;
 
 const double Tol = 1e-6;
 int failures = 0;
@@ -9,7 +9,7 @@ string vectorsPath = args.Length > 0
     ? args[0]
     : Path.GetFullPath(Path.Combine(
         AppContext.BaseDirectory,
-        "../../../../../websocket_nodejs/adb-emulator-server/stream/core/geometry-test-vectors.json"));
+        "../../../../../MobileStreamServer/stream/core/geometry-test-vectors.json"));
 
 if (!File.Exists(vectorsPath))
 {

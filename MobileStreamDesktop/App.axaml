@@ -1,0 +1,10 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="MobileStreamDesktop.App"
+             RequestedThemeVariant="Dark">
+    <!-- Force Dark theme for the professional developer tool appearance -->
+
+    <Application.Styles>
+        <FluentTheme />
+    </Application.Styles>
+</Application>
